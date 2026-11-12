@@ -365,3 +365,11 @@ repomix-output.txt
 # SonarQube
 .sonarqube/
 coverage.xml
+
+# Rust
+/target/
+
+# Local cpumon databases
+*.db
+*.db-wal
+*.db-shm
