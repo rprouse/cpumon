@@ -1,6 +1,7 @@
 //! `cpumon`: monitor Windows CPU/GPU usage and record the processes responsible.
 
 mod gpu_cmd;
+mod monitor_cmd;
 mod top_cmd;
 
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Watch CPU/GPU usage and record offending processes
-    Monitor(MonitorArgs),
+    Monitor(monitor_cmd::MonitorArgs),
     /// Show the worst offenders
     Report(ReportArgs),
     /// List high-usage incidents
@@ -42,37 +43,6 @@ enum Command {
     Top(top_cmd::TopArgs),
     /// Show live GPU usage per adapter, engine and process (diagnostic)
     Gpu(gpu_cmd::GpuArgs),
-}
-
-#[derive(Debug, Args)]
-struct MonitorArgs {
-    /// Time between samples
-    #[arg(long, default_value = "2s", value_parser = parse_duration)]
-    interval: Duration,
-
-    /// Total CPU % that counts as high usage
-    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
-    cpu: u8,
-
-    /// Total GPU % (busiest engine) that counts as high usage
-    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
-    gpu: u8,
-
-    /// Per-process CPU % (of the whole machine) to record during an incident
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=100))]
-    proc_cpu: u8,
-
-    /// Per-process GPU % to record during an incident
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(1..=100))]
-    proc_gpu: u8,
-
-    /// Always record at least this many top processes during an incident
-    #[arg(long, default_value_t = 5)]
-    top: usize,
-
-    /// Consecutive high samples required before an incident starts
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
-    sustain: u32,
 }
 
 #[derive(Debug, Args)]
@@ -143,7 +113,7 @@ fn main() -> Result<()> {
         }
         Command::Top(args) => top_cmd::run(&args),
         Command::Gpu(args) => gpu_cmd::run(&args),
-        Command::Monitor(_) => not_implemented("monitor"),
+        Command::Monitor(args) => monitor_cmd::run(&args),
         Command::Report(_) => not_implemented("report"),
         Command::Incidents(_) => not_implemented("incidents"),
         Command::Show { .. } => not_implemented("show"),
@@ -172,7 +142,7 @@ mod tests {
             panic!("expected monitor");
         };
         assert_eq!(args.interval, Duration::from_secs(2));
-        assert_eq!((args.cpu, args.gpu), (80, 80));
+        assert_eq!((args.cpu, args.gpu, args.proc_core), (80, 80, 90));
         assert_eq!((args.proc_cpu, args.proc_gpu), (10, 10));
         assert_eq!((args.top, args.sustain), (5, 2));
     }
@@ -181,6 +151,16 @@ mod tests {
     fn rejects_out_of_range_threshold() {
         assert!(Cli::try_parse_from(["cpumon", "monitor", "--cpu", "101"]).is_err());
         assert!(Cli::try_parse_from(["cpumon", "monitor", "--sustain", "0"]).is_err());
+        assert!(Cli::try_parse_from(["cpumon", "monitor", "--proc-core", "0"]).is_err());
+    }
+
+    #[test]
+    fn proc_core_may_exceed_one_core() {
+        let cli = Cli::try_parse_from(["cpumon", "monitor", "--proc-core", "400"]).unwrap();
+        let Command::Monitor(args) = cli.command else {
+            panic!("expected monitor");
+        };
+        assert_eq!(args.proc_core, 400);
     }
 
     #[test]

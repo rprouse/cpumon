@@ -7,10 +7,13 @@ pub mod cpu;
 pub mod duration;
 pub mod error;
 pub mod gpu;
+pub mod incident;
+pub mod offenders;
 pub mod paths;
 mod pdh;
 pub mod sampler;
 pub mod snapshot;
+pub mod time;
 pub mod totals;
 
 pub use error::{Error, Result};

@@ -74,7 +74,9 @@ crates/
       sampler.rs           one call per interval: totals + per-process CPU/GPU
       procinfo.rs          command line, image path, user, session (enrichment)
       tree.rs              ancestry resolution with PID-reuse protection
-      incident.rs          threshold / sustain state machine
+      incident.rs          triggers and the sustain state machine
+      offenders.rs         which processes to record during an incident
+      time.rs              timestamps for display
       store/               SQLite schema, migrations, inserts, report queries
   cpumon/                  the `cpumon` binary (CLI, console output)
 docs/
@@ -97,9 +99,18 @@ hot path.
    Instance names are parsed into PID, adapter LUID, and engine type.
 4. **Machine totals**: CPU from `\Processor Information(_Total)\% Processor Utility`;
    GPU as max engine per adapter (Task Manager style) plus the sum across engines.
-5. **Thresholds**: if total CPU or GPU exceeds its threshold for `--sustain`
-   consecutive samples, open (or continue) an **incident**. Record every process over
-   the per-process threshold, or at least the top `--top` processes.
+5. **Triggers**: a sample is high when any of these fire:
+   - **cpu**: total CPU >= `--cpu` (default 80%);
+   - **gpu**: busiest GPU engine >= `--gpu` (default 80%);
+   - **core**: any single process >= `--proc-core` percent of one core (default 90%).
+     One pegged core on a 16-thread machine is only ~6% of the total, so a runaway
+     thread would never reach the total CPU threshold.
+
+   After `--sustain` consecutive high samples an **incident** opens. While it is open,
+   every sample records the offenders: each process over `--proc-cpu` (% of machine),
+   `--proc-core` or `--proc-gpu`, plus the top `--top` CPU and GPU users. Offenders
+   are ranked by their share of one core (capped at 100) or busiest GPU engine,
+   whichever is higher, then by raw CPU.
 6. **Enrichment** (once per `(pid, create_time)`, cached): open the process with
    `PROCESS_QUERY_LIMITED_INFORMATION` and read the command line via
    `NtQueryInformationProcess(ProcessCommandLineInformation)`, the full image path via
@@ -110,7 +121,8 @@ hot path.
    only accepted if its create time is earlier than the child's; otherwise the PID was
    reused and the chain stops. Every ancestor is persisted so the tree survives after
    processes exit.
-8. The incident closes when totals drop below their thresholds.
+8. The incident closes after `--sustain` consecutive normal samples, so brief dips
+   neither end nor split it.
 
 The previous snapshot is kept in memory every interval, so a per-process CPU delta is
 always available the moment a spike is detected.
@@ -176,7 +188,7 @@ The root process of any offender can be found with a recursive CTE over
 ## CLI
 
 ```
-cpumon monitor   [--interval 2s] [--cpu 80] [--gpu 80]
+cpumon monitor   [--interval 2s] [--cpu 80] [--gpu 80] [--proc-core 90]
                  [--proc-cpu 10] [--proc-gpu 10] [--top 5] [--sustain 2] [--db PATH]
 cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top 20]
 cpumon incidents [--since 24h]
@@ -231,7 +243,8 @@ a scheduled task at logon with highest privileges, captures everything.
    (names, parent PID, create time, CPU times) was pulled forward to label processes.
 3. ~~CPU deltas and machine totals.~~ Done: `Sampler` combines everything; `cpumon top`.
    Verified against a single-thread burner: 99.4% of a core, 6.2% of the machine.
-4. Incident state machine and console logging.
+4. ~~Incident state machine and console logging.~~ Done: `cpumon monitor` logs to the
+   console, including the single-process `core` trigger. Not yet persisted.
 5. SQLite storage, enrichment (command line, path, user), ancestry.
 6. `report`, `incidents`, `show`, `db` commands.
 7. Later: `install` scheduled task, ETW option, GUI/dashboard.
