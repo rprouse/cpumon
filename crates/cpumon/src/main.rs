@@ -1,5 +1,7 @@
 //! `cpumon`: monitor Windows CPU/GPU usage and record the processes responsible.
 
+mod gpu_cmd;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -35,6 +37,8 @@ enum Command {
     /// Database maintenance
     #[command(subcommand)]
     Db(DbCommand),
+    /// Show live GPU usage per adapter, engine and process (diagnostic)
+    Gpu(gpu_cmd::GpuArgs),
 }
 
 #[derive(Debug, Args)]
@@ -134,6 +138,7 @@ fn main() -> Result<()> {
             println!("{}", db.display());
             Ok(())
         }
+        Command::Gpu(args) => gpu_cmd::run(&args),
         Command::Monitor(_) => not_implemented("monitor"),
         Command::Report(_) => not_implemented("report"),
         Command::Incidents(_) => not_implemented("incidents"),

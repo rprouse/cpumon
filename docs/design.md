@@ -64,9 +64,12 @@ Cargo.toml                 workspace
 crates/
   cpumon-core/             sampling, process info, storage, queries (library)
     src/
+      error.rs             Error / Result types
       snapshot.rs          NtQuerySystemInformation process snapshot
       cpu.rs               CPU deltas between snapshots
-      gpu.rs               PDH GPU Engine counters + instance-name parsing
+      pdh.rs               reusable wildcard PDH counter query
+      gpu.rs               GPU Engine instance-name parsing, sampler, aggregation
+      adapters.rs          DXGI adapter names for LUIDs
       totals.rs            machine-wide CPU/GPU totals
       procinfo.rs          command line, image path, user, session (enrichment)
       tree.rs              ancestry resolution with PID-reuse protection
@@ -178,6 +181,7 @@ cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top
 cpumon incidents [--since 24h]
 cpumon show <incident-id>        # samples and process trees for one incident
 cpumon db path | prune [--older-than 30d]
+cpumon gpu       [--interval 1s] [--count N] [--top 10]   # live GPU diagnostic
 ```
 
 Example monitor output:
@@ -187,6 +191,22 @@ Example monitor output:
   gpu 87%  3D   msedgewebview2.exe (18244)  <- Teams.exe <- explorer.exe
            "...msedgewebview2.exe --type=gpu-process ..."
 ```
+
+## Measured overhead
+
+Release build, development laptop (16 logical CPUs, Intel UHD + NVIDIA RTX 3050 Ti,
+~1,280 GPU Engine counter instances), `cpumon gpu`:
+
+| | Cost |
+|---|---|
+| Startup (mostly DXGI adapter enumeration loading GPU user-mode drivers) | ~230 ms CPU, once |
+| Per sample (PDH ~2 ms + process snapshot ~7 ms wall) | ~12 ms CPU |
+| At the default 2 s interval | ~0.6% of one core, ~0.04% of the machine |
+| Peak working set | ~16 MB (mostly the GPU driver DLLs loaded by DXGI) |
+
+Possible later optimisations: name adapters via `D3DKMTEnumAdapters2` instead of DXGI
+(avoids loading user-mode drivers), and only take the process snapshot every sample
+while needed for CPU deltas.
 
 ## Reporting
 
@@ -204,9 +224,10 @@ a scheduled task at logon with highest privileges, captures everything.
 ## Roadmap
 
 1. ~~Workspace scaffold, build verified.~~ Done: CLI surface defined, `db path` works.
-2. GPU engine sampler (PDH + instance-name parsing) with a debug print command, to
-   investigate the GPU discrepancy first.
-3. Process snapshot, CPU deltas, machine totals.
+2. ~~GPU engine sampler (PDH + instance-name parsing) with a debug print command, to
+   investigate the GPU discrepancy first.~~ Done: `cpumon gpu`. The process snapshot
+   (names, parent PID, create time, CPU times) was pulled forward to label processes.
+3. CPU deltas and machine totals.
 4. Incident state machine and console logging.
 5. SQLite storage, enrichment (command line, path, user), ancestry.
 6. `report`, `incidents`, `show`, `db` commands.
