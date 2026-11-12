@@ -69,6 +69,29 @@ impl MonitorArgs {
         }
     }
 
+    /// The options as command-line arguments, for running the monitor elsewhere (the
+    /// scheduled task).
+    pub fn to_args(&self) -> Vec<String> {
+        let interval = if self.interval.subsec_millis() == 0 {
+            format!("{}s", self.interval.as_secs())
+        } else {
+            format!("{}ms", self.interval.as_millis())
+        };
+        [
+            ("--interval", interval),
+            ("--cpu", self.cpu.to_string()),
+            ("--gpu", self.gpu.to_string()),
+            ("--proc-core", self.proc_core.to_string()),
+            ("--proc-cpu", self.proc_cpu.to_string()),
+            ("--proc-gpu", self.proc_gpu.to_string()),
+            ("--top", self.top.to_string()),
+            ("--sustain", self.sustain.to_string()),
+        ]
+        .into_iter()
+        .flat_map(|(flag, value)| [flag.to_owned(), value])
+        .collect()
+    }
+
     fn limits(&self) -> OffenderLimits {
         OffenderLimits {
             proc_cpu: f64::from(self.proc_cpu),
@@ -89,7 +112,16 @@ pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
     let mut sampler = Sampler::new().context("starting the sampler")?;
     let mut tracker = IncidentTracker::new(args.thresholds());
     let limits = args.limits();
-    let stop = stop_signal().context("installing the Ctrl+C handler")?;
+    // Without a console (e.g. the logon task) there may be no Ctrl+C to handle; the
+    // task is then stopped by Task Scheduler, and the next run closes any open incident.
+    let (_keep_open, stop) = match stop_signal() {
+        Ok(stop) => (None, stop),
+        Err(e) => {
+            eprintln!("warning: Ctrl+C handling unavailable ({e}); stop by ending the process");
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            (Some(tx), rx)
+        }
+    };
 
     println!(
         "Sampling every {:?} on {} logical CPUs. An incident starts when CPU >= {}%, GPU >= {}% \
@@ -251,5 +283,46 @@ fn print_details(sample: &Sample<'_>, new: &NewProcess) {
     }
     if let Some(error) = &new.details.error {
         println!("{INDENT}note: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        args: MonitorArgs,
+    }
+
+    fn parse(args: &[&str]) -> MonitorArgs {
+        Wrapper::try_parse_from(std::iter::once("monitor").chain(args.iter().copied()))
+            .unwrap()
+            .args
+    }
+
+    #[test]
+    fn to_args_round_trips() {
+        for input in [
+            &[][..],
+            &[
+                "--interval",
+                "1500ms",
+                "--cpu",
+                "70",
+                "--proc-core",
+                "250",
+                "--top",
+                "3",
+            ],
+            &["--interval", "5m", "--sustain", "4", "--gpu", "95"],
+        ] {
+            let original = parse(input);
+            let args = original.to_args();
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(format!("{:?}", parse(&refs)), format!("{original:?}"));
+        }
     }
 }

@@ -9,8 +9,8 @@ offending processes to a local SQLite database: their CPU and per-engine GPU usa
 command line, image path, user, and process ancestry up to the root process. It also
 logs them to the console. Report commands then show the worst offenders over time.
 
-> **Status:** early development. Monitoring, recording and reports work; running as a
-> background task at logon is still to come. See [docs/design.md](docs/design.md) for
+> **Status:** early development. Monitoring, recording, reports and running at logon
+> work. See [docs/design.md](docs/design.md) for
 > the design and roadmap.
 
 ## Usage
@@ -22,6 +22,9 @@ cpumon incidents --since 24h                     # list high-usage episodes
 cpumon show 42 --samples                         # processes, command lines and trees
 cpumon report --since 7d --by root --metric gpu  # worst offenders by application
 cpumon db prune --older-than 30d                 # delete old incidents
+sudo cpumon install                              # run the monitor at every logon (admin)
+cpumon status                                    # is the logon task running?
+sudo cpumon uninstall
 cpumon top / cpumon gpu                          # live diagnostics
 ```
 

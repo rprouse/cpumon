@@ -13,7 +13,7 @@ use windows::Win32::Security::{
     TokenUser,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::{PCWSTR, PWSTR};
@@ -75,7 +75,7 @@ impl ProcessInspector {
             Ok(cmd) => details.command_line = Some(cmd),
             Err(e) => errors.push(format!("command line: {e}")),
         }
-        match self.user(&handle) {
+        match self.user(handle.0) {
             Ok(user) => details.user = user,
             Err(e) => errors.push(format!("user: {}", e.message())),
         }
@@ -86,10 +86,10 @@ impl ProcessInspector {
         details
     }
 
-    fn user(&mut self, process: &OwnedHandle) -> windows::core::Result<Option<String>> {
+    fn user(&mut self, process: HANDLE) -> windows::core::Result<Option<String>> {
         let mut token = HANDLE::default();
         // SAFETY: `process` is a valid handle and `token` a valid out pointer.
-        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }?;
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }?;
         let token = OwnedHandle(token);
 
         let mut needed = 0u32;
@@ -147,6 +147,13 @@ impl ProcessInspector {
         self.users.insert(sid_bytes.to_vec(), user.clone());
         Ok(user)
     }
+}
+
+/// The user running this process, as `DOMAIN\user`.
+pub fn current_user() -> Option<String> {
+    // SAFETY: returns a pseudo-handle that is always valid and needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    ProcessInspector::new().user(process).ok().flatten()
 }
 
 /// A handle closed on drop.
@@ -244,6 +251,12 @@ mod tests {
         assert!(!cmd.is_empty());
         let user = details.user.expect("user");
         assert!(user.contains('\\'), "{user}");
+    }
+
+    #[test]
+    fn finds_current_user() {
+        let user = current_user().expect("current user");
+        assert_eq!(Some(user), ProcessInspector::new().inspect(own_key()).user);
     }
 
     #[test]

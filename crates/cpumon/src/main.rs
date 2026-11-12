@@ -2,6 +2,7 @@
 
 mod gpu_cmd;
 mod incidents_cmd;
+mod install_cmd;
 mod monitor_cmd;
 mod output;
 mod report_cmd;
@@ -36,6 +37,13 @@ enum Command {
     Incidents(incidents_cmd::IncidentsArgs),
     /// Show the processes, command lines and process trees of one incident
     Show(incidents_cmd::ShowArgs),
+    /// Run the monitor at every logon (Task Scheduler), without a console window.
+    /// Needs an elevated terminal, e.g. `sudo cpumon install`
+    Install(install_cmd::InstallArgs),
+    /// Stop and remove the logon task (needs an elevated terminal)
+    Uninstall,
+    /// Show whether the logon task is installed and running
+    Status,
     /// Database maintenance
     #[command(subcommand)]
     Db(DbCommand),
@@ -73,6 +81,9 @@ fn main() -> Result<()> {
         Command::Top(args) => top_cmd::run(&args),
         Command::Gpu(args) => gpu_cmd::run(&args),
         Command::Monitor(args) => monitor_cmd::run(&args, &db),
+        Command::Install(args) => install_cmd::install(&args, &db),
+        Command::Uninstall => install_cmd::uninstall(),
+        Command::Status => install_cmd::status(&db),
         Command::Report(args) => report_cmd::run(&args, &db),
         Command::Incidents(args) => incidents_cmd::run_list(&args, &db),
         Command::Show(args) => incidents_cmd::run_show(&args, &db),
@@ -157,6 +168,16 @@ mod tests {
             panic!("expected prune");
         };
         assert_eq!(older_than, Duration::from_secs(30 * 86_400));
+    }
+
+    #[test]
+    fn install_accepts_monitor_options() {
+        let cli = Cli::try_parse_from(["cpumon", "install", "--elevated", "--cpu", "90"]).unwrap();
+        let Command::Install(args) = cli.command else {
+            panic!("expected install");
+        };
+        assert!(args.elevated && !args.no_start);
+        assert_eq!(args.monitor.cpu, 90);
     }
 
     #[test]

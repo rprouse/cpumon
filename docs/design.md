@@ -24,7 +24,6 @@ offenders over time.
 - Cross-platform support.
 - ETW-based tracing (possible phase 2 if polling misses spikes).
 - A GUI. Reporting starts as CLI commands over the same database.
-- Auto-start / service install (possible later `cpumon install` via Task Scheduler).
 
 ## Background: why the numbers disagree
 
@@ -80,12 +79,14 @@ crates/
       time.rs              FILETIME <-> UTC strings, local display time
       recorder.rs          writes incidents, samples, offenders and ancestry
       console.rs           Ctrl+C / close handling
+      task.rs              logon task (Task Scheduler COM API)
       store/               SQLite schema, migrations, inserts, report queries, pruning
   cpumon/                  the `cpumon` binary (CLI, console output)
     src/
       monitor_cmd.rs       monitor
       report_cmd.rs        report
       incidents_cmd.rs     incidents, show
+      install_cmd.rs       install, uninstall, status
       output.rs            shared table and number formatting (comfy-table)
       top_cmd.rs, gpu_cmd.rs  live diagnostics
 docs/
@@ -186,6 +187,8 @@ cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top
 cpumon incidents [--since 24h]
 cpumon show <incident-id> [--samples]   # processes, command lines, trees; --samples adds the timeline
 cpumon db path | prune [--older-than 30d]
+cpumon install   [--elevated] [--no-start] [monitor options]   # run monitor at logon
+cpumon uninstall | status
 cpumon top       [--interval 2s] [--count N] [--top 5]    # live CPU/GPU diagnostic
 cpumon gpu       [--interval 1s] [--count N] [--top 10]   # live GPU engine diagnostic
 ```
@@ -247,8 +250,29 @@ process's usage in one incident, then its command line, stored ancestry, user an
 ## Privileges
 
 Runs unelevated by default. Some command lines (elevated or protected processes) will
-be unavailable and are recorded as such. Running from an elevated terminal, or later as
-a scheduled task at logon with highest privileges, captures everything.
+be unavailable and are recorded in `info_error`. Running from an elevated terminal, or
+installing the logon task with `--elevated`, captures everything.
+
+## Running at logon
+
+`cpumon install` registers a Task Scheduler task named `cpumon` through the Task
+Scheduler COM API (no `schtasks.exe`):
+
+- Trigger: logon of the installing user. Action: the current `cpumon.exe` with
+  `--db <absolute path> monitor <the given monitor options>`.
+- Principal: that user with logon type S4U ("run whether the user is logged on or not",
+  no password stored). S4U tasks run without a desktop, so no console window appears.
+  Registering an S4U task needs administrator rights, so `install` and `uninstall`
+  must run elevated, e.g. with Windows' built-in `sudo` (verified). The task itself
+  still runs with the user's normal rights unless `--elevated` is given, which sets
+  run level `HighestAvailable`.
+- Settings: no time limit, runs on battery, one instance, normal priority, restarted up
+  to 3 times a minute apart if it fails. Started immediately unless `--no-start`.
+- Stopping the task ends the process without Ctrl+C; the incident left open is closed
+  at its last sample on the next start.
+
+`cpumon uninstall` stops and deletes the task (the database is kept); `cpumon status`
+reports whether it is installed and running. Reinstall after moving `cpumon.exe`.
 
 ## Roadmap
 
@@ -264,4 +288,5 @@ a scheduled task at logon with highest privileges, captures everything.
    records to the database and prints command line, tree and user for new offenders.
 6. ~~`report`, `incidents`, `show`, `db` commands.~~ Done: grouping by name, command
    line or application root; `db prune` removes old incidents and orphaned processes.
-7. Later: `install` scheduled task, ETW option, GUI/dashboard.
+7. ~~`install` logon task.~~ Done: `install`, `uninstall`, `status`.
+8. Later: ETW option, GUI/dashboard.

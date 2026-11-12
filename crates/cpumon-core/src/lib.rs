@@ -18,6 +18,7 @@ pub mod report;
 pub mod sampler;
 pub mod snapshot;
 pub mod store;
+pub mod task;
 pub mod time;
 pub mod totals;
 pub mod tree;
