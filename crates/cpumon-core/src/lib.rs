@@ -14,6 +14,7 @@ pub mod paths;
 mod pdh;
 pub mod procinfo;
 pub mod recorder;
+pub mod report;
 pub mod sampler;
 pub mod snapshot;
 pub mod store;

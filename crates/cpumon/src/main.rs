@@ -1,14 +1,17 @@
 //! `cpumon`: monitor Windows CPU/GPU usage and record the processes responsible.
 
 mod gpu_cmd;
+mod incidents_cmd;
 mod monitor_cmd;
+mod output;
+mod report_cmd;
 mod top_cmd;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use cpumon_core::duration::parse_duration;
 use cpumon_core::paths::default_db_path;
 
@@ -28,14 +31,11 @@ enum Command {
     /// Watch CPU/GPU usage and record offending processes
     Monitor(monitor_cmd::MonitorArgs),
     /// Show the worst offenders
-    Report(ReportArgs),
+    Report(report_cmd::ReportArgs),
     /// List high-usage incidents
-    Incidents(IncidentsArgs),
-    /// Show samples and process trees for one incident
-    Show {
-        /// Incident id (from `cpumon incidents`)
-        incident_id: i64,
-    },
+    Incidents(incidents_cmd::IncidentsArgs),
+    /// Show the processes, command lines and process trees of one incident
+    Show(incidents_cmd::ShowArgs),
     /// Database maintenance
     #[command(subcommand)]
     Db(DbCommand),
@@ -45,58 +45,17 @@ enum Command {
     Gpu(gpu_cmd::GpuArgs),
 }
 
-#[derive(Debug, Args)]
-struct ReportArgs {
-    /// How far back to look
-    #[arg(long, default_value = "7d", value_parser = parse_duration)]
-    since: Duration,
-
-    /// How to group offenders
-    #[arg(long, value_enum, default_value_t = GroupBy::Name)]
-    by: GroupBy,
-
-    /// Which usage to rank by
-    #[arg(long, value_enum, default_value_t = Metric::Cpu)]
-    metric: Metric,
-
-    /// Number of rows to show
-    #[arg(long, default_value_t = 20)]
-    top: usize,
-}
-
-#[derive(Debug, Args)]
-struct IncidentsArgs {
-    /// How far back to look
-    #[arg(long, default_value = "24h", value_parser = parse_duration)]
-    since: Duration,
-}
-
 #[derive(Debug, Subcommand)]
 enum DbCommand {
     /// Print the database path
     Path,
-    /// Delete data older than the given age
+    /// Delete incidents that ended more than the given time ago, and processes no
+    /// longer referenced
     Prune {
         /// Age of data to delete
         #[arg(long, default_value = "30d", value_parser = parse_duration)]
         older_than: Duration,
     },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum GroupBy {
-    /// Process image name
-    Name,
-    /// Root ancestor process
-    Root,
-    /// Exact command line
-    Cmdline,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Metric {
-    Cpu,
-    Gpu,
 }
 
 fn main() -> Result<()> {
@@ -114,15 +73,26 @@ fn main() -> Result<()> {
         Command::Top(args) => top_cmd::run(&args),
         Command::Gpu(args) => gpu_cmd::run(&args),
         Command::Monitor(args) => monitor_cmd::run(&args, &db),
-        Command::Report(_) => not_implemented("report"),
-        Command::Incidents(_) => not_implemented("incidents"),
-        Command::Show { .. } => not_implemented("show"),
-        Command::Db(DbCommand::Prune { .. }) => not_implemented("db prune"),
+        Command::Report(args) => report_cmd::run(&args, &db),
+        Command::Incidents(args) => incidents_cmd::run_list(&args, &db),
+        Command::Show(args) => incidents_cmd::run_show(&args, &db),
+        Command::Db(DbCommand::Prune { older_than }) => prune(older_than, &db),
     }
 }
 
-fn not_implemented(command: &str) -> Result<()> {
-    bail!("`cpumon {command}` is not implemented yet")
+fn prune(older_than: Duration, db: &std::path::Path) -> Result<()> {
+    let Some(store) = output::open_existing(db)? else {
+        return Ok(());
+    };
+    let before = output::cutoff_utc(older_than);
+    let stats = store.prune(&before)?;
+    println!(
+        "Deleted {} incident(s) that ended before {} and {} process record(s) no longer referenced.",
+        stats.incidents,
+        cpumon_core::time::utc_to_local(&before),
+        stats.processes,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -161,6 +131,32 @@ mod tests {
             panic!("expected monitor");
         };
         assert_eq!(args.proc_core, 400);
+    }
+
+    #[test]
+    fn report_defaults_match_design() {
+        let cli = Cli::try_parse_from(["cpumon", "report"]).unwrap();
+        let Command::Report(args) = cli.command else {
+            panic!("expected report");
+        };
+        assert_eq!(args.since, Duration::from_secs(7 * 86_400));
+        assert_eq!(args.by, report_cmd::GroupBy::Name);
+        assert_eq!(args.metric, report_cmd::Metric::Cpu);
+        assert_eq!(args.top, 20);
+    }
+
+    #[test]
+    fn parses_show_and_prune() {
+        let cli = Cli::try_parse_from(["cpumon", "show", "12", "--samples"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show");
+        };
+        assert_eq!((args.incident_id, args.samples), (12, true));
+        let cli = Cli::try_parse_from(["cpumon", "db", "prune"]).unwrap();
+        let Command::Db(DbCommand::Prune { older_than }) = cli.command else {
+            panic!("expected prune");
+        };
+        assert_eq!(older_than, Duration::from_secs(30 * 86_400));
     }
 
     #[test]

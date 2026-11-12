@@ -10,6 +10,8 @@ use crate::totals::MachineCpu;
 /// Everything measured in one interval.
 #[derive(Debug)]
 pub struct Sample<'a> {
+    /// Seconds covered by this sample (since the previous one).
+    pub seconds: f64,
     /// Overall CPU utilisation in percent (Task Manager's figure; may exceed 100).
     pub cpu_total: f64,
     /// Processes that used CPU, busiest first.
@@ -32,6 +34,7 @@ pub struct Sampler {
     cpu: CpuTracker,
     gpu_summary: GpuSummary,
     logical_cpus: u32,
+    previous_time: i64,
 }
 
 impl Sampler {
@@ -43,6 +46,7 @@ impl Sampler {
         let snapshot = ProcessSnapshot::new()?;
         let mut cpu = CpuTracker::new(logical_cpus);
         cpu.update_from(&snapshot);
+        let previous_time = snapshot.system_time();
         Ok(Self {
             machine_cpu,
             gpu,
@@ -50,6 +54,7 @@ impl Sampler {
             cpu,
             gpu_summary: GpuSummary::default(),
             logical_cpus,
+            previous_time,
         })
     }
 
@@ -66,7 +71,11 @@ impl Sampler {
         self.gpu_summary = summarize(gpu.usages);
         self.snapshot.refresh()?;
         let cpu = self.cpu.update_from(&self.snapshot);
+        let now = self.snapshot.system_time();
+        let seconds = (now - self.previous_time).max(0) as f64 / 10_000_000.0;
+        self.previous_time = now;
         Ok(Sample {
+            seconds,
             cpu_total,
             cpu,
             gpu: &self.gpu_summary,
@@ -85,6 +94,11 @@ mod tests {
         let mut sampler = Sampler::new().expect("create sampler");
         std::thread::sleep(std::time::Duration::from_millis(200));
         let sample = sampler.sample().expect("sample");
+        assert!(
+            sample.seconds > 0.1 && sample.seconds < 60.0,
+            "{}",
+            sample.seconds
+        );
         assert!(sample.cpu_total >= 0.0);
         assert!(sample.cpu.iter().all(|p| p.pct_core >= 0.0));
         assert!(sample.snapshot.find(std::process::id()).is_some());

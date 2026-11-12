@@ -18,6 +18,7 @@ use cpumon_core::store::Store;
 use cpumon_core::time::{local_timestamp, now_filetime};
 
 use crate::gpu_cmd::adapter_name;
+use crate::output::truncate;
 
 /// Longest command line printed to the console (the database keeps it all).
 const MAX_COMMAND_LINE_CHARS: usize = 300;
@@ -250,24 +251,5 @@ fn print_details(sample: &Sample<'_>, new: &NewProcess) {
     }
     if let Some(error) = &new.details.error {
         println!("{INDENT}note: {error}");
-    }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    match s.char_indices().nth(max_chars) {
-        Some((i, _)) => format!("{}...", &s[..i]),
-        None => s.to_owned(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncates_long_strings_on_char_boundaries() {
-        assert_eq!(truncate("abc", 5), "abc");
-        assert_eq!(truncate("abcdef", 3), "abc...");
-        assert_eq!(truncate("ééé", 2), "éé...");
     }
 }

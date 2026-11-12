@@ -3,7 +3,7 @@
 //! Each entry upgrades the schema from version `i` to `i + 1`. Never edit a migration
 //! that has shipped; add a new one instead.
 
-pub(super) const MIGRATIONS: &[&str] = &[V1];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// Initial schema. All `*_utc` columns hold fixed-width UTC strings such as
 /// `2026-11-12T14:05:52.1234567Z`.
@@ -79,4 +79,10 @@ CREATE TABLE process_sample (
     PRIMARY KEY (sample_id, process_id)
 ) WITHOUT ROWID;
 CREATE INDEX process_sample_process ON process_sample (process_id);
+";
+
+/// Seconds each sample covers, for CPU-seconds and GPU-seconds in reports. Rows from
+/// before this migration have NULL and fall back to the gap since the previous sample.
+const V2: &str = r"
+ALTER TABLE sample ADD COLUMN interval_s REAL;
 ";

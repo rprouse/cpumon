@@ -76,11 +76,18 @@ crates/
       tree.rs              ancestry resolution with PID-reuse protection
       incident.rs          triggers and the sustain state machine
       offenders.rs         which processes to record during an incident
+      report.rs            worst-offender grouping (name, application root, command line)
       time.rs              FILETIME <-> UTC strings, local display time
       recorder.rs          writes incidents, samples, offenders and ancestry
       console.rs           Ctrl+C / close handling
-      store/               SQLite schema, migrations, inserts, report queries
+      store/               SQLite schema, migrations, inserts, report queries, pruning
   cpumon/                  the `cpumon` binary (CLI, console output)
+    src/
+      monitor_cmd.rs       monitor
+      report_cmd.rs        report
+      incidents_cmd.rs     incidents, show
+      output.rs            shared table and number formatting (comfy-table)
+      top_cmd.rs, gpu_cmd.rs  live diagnostics
 docs/
 ```
 
@@ -134,7 +141,9 @@ always available the moment a spike is detected.
 Location: `%LOCALAPPDATA%\cpumon\cpumon.db` (overridable with `--db`). WAL mode,
 `synchronous=NORMAL`, foreign keys on. The schema is versioned through
 `PRAGMA user_version`; migrations live in `crates/cpumon-core/src/store/schema.rs`.
-Retention pruning (default 30 days) comes with `cpumon db prune`.
+`cpumon db prune` (default `--older-than 30d`) deletes incidents that ended before the
+cutoff, with their samples, and then any process rows no longer referenced by a sample
+directly or as an ancestor. Incidents in progress are never pruned.
 
 Timestamps are fixed-width UTC strings with 100 ns precision, such as
 `2026-11-12T14:05:52.1234567Z`. They sort chronologically and work with SQLite's date
@@ -144,7 +153,7 @@ functions. Process identity is `(pid, create_time_utc)`.
 |---|---|
 | `adapter` | LUID to adapter description, refreshed at startup |
 | `incident` | start/end, triggers fired (e.g. `cpu+core`), sample count, peak CPU/GPU/per-process core |
-| `sample` | one row per sample during an incident: totals, busiest process, triggers |
+| `sample` | one row per sample during an incident: totals, busiest process, triggers, seconds covered (`interval_s`, schema v2) |
 | `sample_gpu_engine` | busy engines (>= 0.1%) per sample, per adapter |
 | `process` | one row per process instance: name, image path, command line, user, session, parent PID, link to parent row, `info_error`, first/last seen |
 | `process_sample` | each offender in each sample: CPU (% machine and % core), GPU %, engine, adapter, working set |
@@ -175,7 +184,7 @@ cpumon monitor   [--interval 2s] [--cpu 80] [--gpu 80] [--proc-core 90]
                  [--proc-cpu 10] [--proc-gpu 10] [--top 5] [--sustain 2] [--db PATH]
 cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top 20]
 cpumon incidents [--since 24h]
-cpumon show <incident-id>        # samples and process trees for one incident
+cpumon show <incident-id> [--samples]   # processes, command lines, trees; --samples adds the timeline
 cpumon db path | prune [--older-than 30d]
 cpumon top       [--interval 2s] [--count N] [--top 5]    # live CPU/GPU diagnostic
 cpumon gpu       [--interval 1s] [--count N] [--top 10]   # live GPU engine diagnostic
@@ -207,10 +216,33 @@ while needed for CPU deltas.
 
 ## Reporting
 
-`cpumon report` ranks offenders by accumulated CPU-seconds or GPU-seconds while above
-threshold, number of incidents, and peak usage, grouped by process name, root ancestor,
-or exact command line. A GUI or HTML dashboard can be layered on the same
-`cpumon-core` queries later.
+Only time during incidents is recorded, so all figures are "while the machine was
+busy". Each sample stores the seconds it covers, so usage is accumulated as:
+
+- **CPU time** in core-seconds: `cpu_pct_core / 100 x seconds` (one core fully busy
+  for 1 s = 1 s).
+- **GPU time** in seconds: the process's busiest engine `gpu_pct / 100 x seconds`.
+
+Samples recorded before schema v2 have no `interval_s`; the gap since the previous
+sample of the same incident is used instead.
+
+`cpumon report` ranks groups by CPU or GPU time (`--metric`), and also shows peak
+usage, the number of incidents and process instances, and when the group was last
+seen. Groups (`--by`):
+
+- `name`: image name, case-insensitive.
+- `cmdline`: exact command line.
+- `root`: the application a process belongs to. Walking up the recorded ancestry,
+  the root is the last process before a shell or system host (`explorer.exe`,
+  `svchost.exe`, `services.exe`, `sihost.exe`, `taskhostw.exe`, `wininit.exe`, ...).
+  So Teams' `msedgewebview2.exe` renderers group under `ms-teams.exe` instead of
+  `sihost.exe`. A host that is itself an offender is its own root.
+
+`cpumon incidents` lists incidents with duration, triggers, peaks and the top process
+(most CPU, capped at one core, plus GPU over the incident). `cpumon show` lists each
+process's usage in one incident, then its command line, stored ancestry, user and any
+`info_error`. The aggregation and grouping live in `cpumon-core` (`store/queries.rs`,
+`report.rs`) so a GUI or HTML dashboard can reuse them.
 
 ## Privileges
 
@@ -230,5 +262,6 @@ a scheduled task at logon with highest privileges, captures everything.
    console, including the single-process `core` trigger. Not yet persisted.
 5. ~~SQLite storage, enrichment (command line, path, user), ancestry.~~ Done: `monitor`
    records to the database and prints command line, tree and user for new offenders.
-6. `report`, `incidents`, `show`, `db` commands.
+6. ~~`report`, `incidents`, `show`, `db` commands.~~ Done: grouping by name, command
+   line or application root; `db prune` removes old incidents and orphaned processes.
 7. Later: `install` scheduled task, ETW option, GUI/dashboard.

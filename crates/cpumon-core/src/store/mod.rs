@@ -1,6 +1,11 @@
 //! SQLite storage. See `schema.rs` for the tables.
 
+mod queries;
 mod schema;
+
+pub use queries::{
+    IncidentProcess, IncidentSummary, ProcessInfo, ProcessUsage, PruneStats, SampleSummary,
+};
 
 use std::path::Path;
 
@@ -15,6 +20,8 @@ use crate::incident::{Incident, Triggers};
 pub struct SampleRow<'a> {
     pub incident_id: i64,
     pub ts_utc: &'a str,
+    /// Seconds covered by the sample.
+    pub interval_s: f64,
     pub cpu_total: f64,
     pub gpu_max_engine: f64,
     pub gpu_sum: f64,
@@ -206,8 +213,8 @@ impl Store {
         self.conn
             .prepare_cached(
                 "INSERT INTO sample (incident_id, ts_utc, cpu_total, gpu_max_engine, gpu_sum,
-                                     max_proc_core, triggers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                     max_proc_core, triggers, interval_s)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?
             .execute(params![
                 row.incident_id,
@@ -217,6 +224,7 @@ impl Store {
                 row.gpu_sum,
                 row.max_proc_core,
                 row.triggers.to_string(),
+                row.interval_s,
             ])?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -326,7 +334,7 @@ mod tests {
     #[test]
     fn migrates_new_database_to_latest() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     #[test]
@@ -340,7 +348,7 @@ mod tests {
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
         let count: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM incident", [], |r| r.get(0))
@@ -412,6 +420,7 @@ mod tests {
                 .insert_sample(&SampleRow {
                     incident_id: with_samples,
                     ts_utc: ts,
+                    interval_s: 2.0,
                     cpu_total: 1.0,
                     gpu_max_engine: 2.0,
                     gpu_sum: 3.0,
@@ -498,6 +507,7 @@ mod tests {
             .insert_sample(&SampleRow {
                 incident_id: incident,
                 ts_utc: "2026-01-01T00:00:00.0000000Z",
+                interval_s: 2.0,
                 cpu_total: 50.0,
                 gpu_max_engine: 99.0,
                 gpu_sum: 120.0,

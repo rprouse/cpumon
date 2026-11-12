@@ -9,19 +9,27 @@ offending processes to a local SQLite database: their CPU and per-engine GPU usa
 command line, image path, user, and process ancestry up to the root process. It also
 logs them to the console. Report commands then show the worst offenders over time.
 
-> **Status:** early development. The CLI is scaffolded, but the commands are not yet
-> implemented. See [docs/design.md](docs/design.md) for the full plan and roadmap.
+> **Status:** early development. Monitoring, recording and reports work; running as a
+> background task at logon is still to come. See [docs/design.md](docs/design.md) for
+> the design and roadmap.
 
-## Planned usage
+## Usage
 
 ```powershell
-cpumon monitor --interval 2s --cpu 80 --gpu 80   # watch and record
+cpumon monitor                                   # watch and record (Ctrl+C to stop)
+cpumon monitor --interval 2s --cpu 80 --gpu 80 --proc-core 90
 cpumon incidents --since 24h                     # list high-usage episodes
-cpumon show 42                                   # details and process trees for one incident
-cpumon report --since 7d --by root --metric gpu  # worst offenders
+cpumon show 42 --samples                         # processes, command lines and trees
+cpumon report --since 7d --by root --metric gpu  # worst offenders by application
+cpumon db prune --older-than 30d                 # delete old incidents
+cpumon top / cpumon gpu                          # live diagnostics
 ```
 
-The database is stored at `%LOCALAPPDATA%\cpumon\cpumon.db`.
+An incident starts when total CPU or GPU (busiest engine) stays at or above its
+threshold, or one process uses most of a core, for `--sustain` samples in a row.
+
+The database is stored at `%LOCALAPPDATA%\cpumon\cpumon.db` (`cpumon db path`).
+Run from an elevated terminal to capture command lines of system processes.
 
 ## Building
 

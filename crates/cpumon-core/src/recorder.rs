@@ -91,6 +91,7 @@ impl Recorder {
             let sample_id = store.insert_sample(&SampleRow {
                 incident_id,
                 ts_utc: &ts,
+                interval_s: sample.seconds,
                 cpu_total: observation.cpu,
                 gpu_max_engine: observation.gpu,
                 gpu_sum: sample.gpu.sum(),
