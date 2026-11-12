@@ -70,7 +70,8 @@ crates/
       pdh.rs               reusable wildcard PDH counter query
       gpu.rs               GPU Engine instance-name parsing, sampler, aggregation
       adapters.rs          DXGI adapter names for LUIDs
-      totals.rs            machine-wide CPU/GPU totals
+      totals.rs            machine-wide CPU total (% Processor Utility)
+      sampler.rs           one call per interval: totals + per-process CPU/GPU
       procinfo.rs          command line, image path, user, session (enrichment)
       tree.rs              ancestry resolution with PID-reuse protection
       incident.rs          threshold / sustain state machine
@@ -181,7 +182,8 @@ cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top
 cpumon incidents [--since 24h]
 cpumon show <incident-id>        # samples and process trees for one incident
 cpumon db path | prune [--older-than 30d]
-cpumon gpu       [--interval 1s] [--count N] [--top 10]   # live GPU diagnostic
+cpumon top       [--interval 2s] [--count N] [--top 5]    # live CPU/GPU diagnostic
+cpumon gpu       [--interval 1s] [--count N] [--top 10]   # live GPU engine diagnostic
 ```
 
 Example monitor output:
@@ -227,7 +229,8 @@ a scheduled task at logon with highest privileges, captures everything.
 2. ~~GPU engine sampler (PDH + instance-name parsing) with a debug print command, to
    investigate the GPU discrepancy first.~~ Done: `cpumon gpu`. The process snapshot
    (names, parent PID, create time, CPU times) was pulled forward to label processes.
-3. CPU deltas and machine totals.
+3. ~~CPU deltas and machine totals.~~ Done: `Sampler` combines everything; `cpumon top`.
+   Verified against a single-thread burner: 99.4% of a core, 6.2% of the machine.
 4. Incident state machine and console logging.
 5. SQLite storage, enrichment (command line, path, user), ancestry.
 6. `report`, `incidents`, `show`, `db` commands.

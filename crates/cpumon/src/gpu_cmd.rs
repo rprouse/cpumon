@@ -98,7 +98,7 @@ pub fn run(args: &GpuArgs) -> Result<()> {
     Ok(())
 }
 
-fn adapter_name(adapters: &[AdapterInfo], luid: Luid) -> String {
+pub(crate) fn adapter_name(adapters: &[AdapterInfo], luid: Luid) -> String {
     adapters
         .iter()
         .find(|a| a.luid == luid)

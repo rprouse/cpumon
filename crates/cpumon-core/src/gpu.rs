@@ -282,6 +282,11 @@ impl GpuSampler {
         })
     }
 
+    /// Names for the engine type ids in samples.
+    pub fn engine_types(&self) -> &EngineTypes {
+        &self.engine_types
+    }
+
     /// Reads utilisation since the previous call (or since [`new`](Self::new)).
     pub fn sample(&mut self) -> Result<GpuReading<'_>> {
         self.usages.clear();

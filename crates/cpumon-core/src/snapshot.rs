@@ -6,7 +6,9 @@
 use std::mem::offset_of;
 use std::ops::Range;
 
-use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
+use windows::Wdk::System::SystemInformation::{
+    NtQuerySystemInformation, NtQuerySystemTime, SystemProcessInformation,
+};
 use windows::Win32::Foundation::STATUS_INFO_LENGTH_MISMATCH;
 
 use crate::error::{Error, Result};
@@ -37,6 +39,44 @@ pub struct ProcessSnapshot {
     buffer: Vec<u64>,
     entries: Vec<ProcessEntry>,
     names: String,
+    system_time: i64,
+}
+
+/// Identifies a process instance. PIDs are reused, so the create time is part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProcessKey {
+    pub pid: u32,
+    /// Creation time as a FILETIME (100 ns intervals since 1601-01-01 UTC).
+    pub create_time: i64,
+}
+
+impl ProcessEntry {
+    /// The process's identity.
+    pub fn key(&self) -> ProcessKey {
+        ProcessKey {
+            pid: self.pid,
+            create_time: self.create_time,
+        }
+    }
+
+    /// Total user + kernel CPU time in 100 ns units.
+    pub fn cpu_time(&self) -> i64 {
+        self.user_time.saturating_add(self.kernel_time)
+    }
+}
+
+/// Current system time as a FILETIME.
+fn system_time() -> Result<i64> {
+    let mut now = 0i64;
+    // SAFETY: `now` is a valid out pointer.
+    let status = unsafe { NtQuerySystemTime(&mut now) };
+    if status.is_err() {
+        return Err(Error::NtStatus {
+            call: "NtQuerySystemTime",
+            status: status.0 as u32,
+        });
+    }
+    Ok(now)
 }
 
 /// Leading fields of the native `SYSTEM_PROCESS_INFORMATION` (x64 layout), which the
@@ -99,8 +139,14 @@ impl ProcessSnapshot {
     /// Replaces the contents with a fresh snapshot.
     pub fn refresh(&mut self) -> Result<()> {
         let len = self.query()?;
+        self.system_time = system_time()?;
         self.parse(len);
         Ok(())
+    }
+
+    /// When the snapshot was taken, as a FILETIME (100 ns intervals since 1601 UTC).
+    pub fn system_time(&self) -> i64 {
+        self.system_time
     }
 
     /// The processes, in the order the kernel returned them.
