@@ -107,13 +107,14 @@ struct SystemProcessInfo {
     working_set_size: usize,
 }
 
+/// Native `UNICODE_STRING`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UnicodeString {
+pub(crate) struct UnicodeString {
     /// Length in bytes, excluding any terminator.
-    length: u16,
-    maximum_length: u16,
-    buffer: *const u16,
+    pub(crate) length: u16,
+    pub(crate) maximum_length: u16,
+    pub(crate) buffer: *const u16,
 }
 
 // Offsets documented for the public parts of SYSTEM_PROCESS_INFORMATION on x64.

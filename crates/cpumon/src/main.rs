@@ -113,7 +113,7 @@ fn main() -> Result<()> {
         }
         Command::Top(args) => top_cmd::run(&args),
         Command::Gpu(args) => gpu_cmd::run(&args),
-        Command::Monitor(args) => monitor_cmd::run(&args),
+        Command::Monitor(args) => monitor_cmd::run(&args, &db),
         Command::Report(_) => not_implemented("report"),
         Command::Incidents(_) => not_implemented("incidents"),
         Command::Show { .. } => not_implemented("show"),

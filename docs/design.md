@@ -76,7 +76,9 @@ crates/
       tree.rs              ancestry resolution with PID-reuse protection
       incident.rs          triggers and the sustain state machine
       offenders.rs         which processes to record during an incident
-      time.rs              timestamps for display
+      time.rs              FILETIME <-> UTC strings, local display time
+      recorder.rs          writes incidents, samples, offenders and ancestry
+      console.rs           Ctrl+C / close handling
       store/               SQLite schema, migrations, inserts, report queries
   cpumon/                  the `cpumon` binary (CLI, console output)
 docs/
@@ -130,60 +132,41 @@ always available the moment a spike is detected.
 ## Storage
 
 Location: `%LOCALAPPDATA%\cpumon\cpumon.db` (overridable with `--db`). WAL mode,
-schema versioned through `PRAGMA user_version`. Retention pruning (default 30 days).
-All timestamps are stored in UTC.
+`synchronous=NORMAL`, foreign keys on. The schema is versioned through
+`PRAGMA user_version`; migrations live in `crates/cpumon-core/src/store/schema.rs`.
+Retention pruning (default 30 days) comes with `cpumon db prune`.
+
+Timestamps are fixed-width UTC strings with 100 ns precision, such as
+`2026-11-12T14:05:52.1234567Z`. They sort chronologically and work with SQLite's date
+functions. Process identity is `(pid, create_time_utc)`.
+
+| Table | Contents |
+|---|---|
+| `adapter` | LUID to adapter description, refreshed at startup |
+| `incident` | start/end, triggers fired (e.g. `cpu+core`), sample count, peak CPU/GPU/per-process core |
+| `sample` | one row per sample during an incident: totals, busiest process, triggers |
+| `sample_gpu_engine` | busy engines (>= 0.1%) per sample, per adapter |
+| `process` | one row per process instance: name, image path, command line, user, session, parent PID, link to parent row, `info_error`, first/last seen |
+| `process_sample` | each offender in each sample: CPU (% machine and % core), GPU %, engine, adapter, working set |
+
+Each sample is written in one transaction. The incident row is updated every sample,
+so a crash leaves a usable record; incidents left open are closed at their last
+sample on the next start. `Ctrl+C`, `Ctrl+Break` and closing the console end the
+incident cleanly.
+
+Details (command line, path, user) are read once per process, when it is first
+recorded, along with any of its ancestors not yet stored. Each ancestor gets its own
+`process` row linked through `parent_process_id`, so the chain survives after the
+processes exit. The root of any offender can be found with a recursive CTE:
 
 ```sql
-CREATE TABLE incident (
-    id            INTEGER PRIMARY KEY,
-    started_utc   TEXT NOT NULL,
-    ended_utc     TEXT,
-    trigger       TEXT NOT NULL,          -- 'cpu' | 'gpu' | 'both'
-    peak_cpu      REAL,
-    peak_gpu      REAL
-);
-
-CREATE TABLE sample (
-    id              INTEGER PRIMARY KEY,
-    incident_id     INTEGER NOT NULL REFERENCES incident(id),
-    ts_utc          TEXT NOT NULL,
-    cpu_total       REAL NOT NULL,
-    gpu_max_engine  REAL NOT NULL,
-    gpu_sum         REAL NOT NULL,
-    gpu_detail_json TEXT                  -- per adapter/engine breakdown
-);
-
-CREATE TABLE process (
-    id                INTEGER PRIMARY KEY,
-    pid               INTEGER NOT NULL,
-    create_time_utc   TEXT NOT NULL,
-    name              TEXT NOT NULL,
-    image_path        TEXT,
-    command_line      TEXT,
-    info_error        TEXT,               -- e.g. 'access denied'
-    user              TEXT,
-    session_id        INTEGER,
-    parent_process_id INTEGER REFERENCES process(id),
-    first_seen_utc    TEXT NOT NULL,
-    last_seen_utc     TEXT NOT NULL,
-    UNIQUE (pid, create_time_utc)
-);
-
-CREATE TABLE process_sample (
-    sample_id         INTEGER NOT NULL REFERENCES sample(id),
-    process_id        INTEGER NOT NULL REFERENCES process(id),
-    cpu_pct_machine   REAL NOT NULL,
-    cpu_pct_core      REAL NOT NULL,
-    gpu_pct           REAL NOT NULL,
-    gpu_engine        TEXT,
-    gpu_adapter       TEXT,
-    working_set_bytes INTEGER,
-    PRIMARY KEY (sample_id, process_id)
-);
+WITH RECURSIVE chain(id, name, parent, depth) AS (
+    SELECT id, name, parent_process_id, 0 FROM process WHERE id = ?
+    UNION ALL
+    SELECT p.id, p.name, p.parent_process_id, depth + 1
+    FROM process p JOIN chain c ON p.id = c.parent)
+SELECT name FROM chain ORDER BY depth DESC LIMIT 1;
 ```
-
-The root process of any offender can be found with a recursive CTE over
-`process.parent_process_id`.
 
 ## CLI
 
@@ -245,6 +228,7 @@ a scheduled task at logon with highest privileges, captures everything.
    Verified against a single-thread burner: 99.4% of a core, 6.2% of the machine.
 4. ~~Incident state machine and console logging.~~ Done: `cpumon monitor` logs to the
    console, including the single-process `core` trigger. Not yet persisted.
-5. SQLite storage, enrichment (command line, path, user), ancestry.
+5. ~~SQLite storage, enrichment (command line, path, user), ancestry.~~ Done: `monitor`
+   records to the database and prints command line, tree and user for new offenders.
 6. `report`, `incidents`, `show`, `db` commands.
 7. Later: `install` scheduled task, ETW option, GUI/dashboard.

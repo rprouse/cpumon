@@ -1,17 +1,26 @@
-//! `cpumon monitor`: detect high-usage incidents and log the offending processes.
+//! `cpumon monitor`: detect high-usage incidents, record them to the database and log
+//! the offending processes.
 
+use std::path::Path;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Args;
 use cpumon_core::adapters::{AdapterInfo, list_adapters};
+use cpumon_core::console::stop_signal;
 use cpumon_core::duration::parse_duration;
 use cpumon_core::incident::{Incident, IncidentTracker, Observation, Thresholds, Transition};
 use cpumon_core::offenders::{Offender, OffenderLimits, select_offenders};
+use cpumon_core::recorder::{NewProcess, Recorder};
 use cpumon_core::sampler::{Sample, Sampler};
-use cpumon_core::time::local_timestamp;
+use cpumon_core::store::Store;
+use cpumon_core::time::{local_timestamp, now_filetime};
 
 use crate::gpu_cmd::adapter_name;
+
+/// Longest command line printed to the console (the database keeps it all).
+const MAX_COMMAND_LINE_CHARS: usize = 300;
 
 #[derive(Debug, Args)]
 pub struct MonitorArgs {
@@ -70,15 +79,20 @@ impl MonitorArgs {
     }
 }
 
-pub fn run(args: &MonitorArgs) -> Result<()> {
+pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
     let adapters = list_adapters().unwrap_or_default();
+    let store = Store::open(db).with_context(|| format!("opening database {}", db.display()))?;
+    store.upsert_adapters(&adapters)?;
+    let closed = store.close_open_incidents()?;
+    let mut recorder = Recorder::new(store);
     let mut sampler = Sampler::new().context("starting the sampler")?;
     let mut tracker = IncidentTracker::new(args.thresholds());
     let limits = args.limits();
+    let stop = stop_signal().context("installing the Ctrl+C handler")?;
 
     println!(
         "Sampling every {:?} on {} logical CPUs. An incident starts when CPU >= {}%, GPU >= {}% \
-         or one process >= {}% of a core for {} samples in a row. Ctrl+C to stop.",
+         or one process >= {}% of a core for {} samples in a row.",
         args.interval,
         sampler.logical_cpus(),
         args.cpu,
@@ -86,12 +100,18 @@ pub fn run(args: &MonitorArgs) -> Result<()> {
         args.proc_core,
         args.sustain,
     );
+    println!("Recording to {}. Ctrl+C to stop.", db.display());
+    if closed > 0 {
+        println!("Closed {closed} incident(s) left open by a previous run.");
+    }
 
     let mut started_at = Instant::now();
     let mut next = Instant::now() + args.interval;
     loop {
-        if let Some(wait) = next.checked_duration_since(Instant::now()) {
-            std::thread::sleep(wait);
+        let wait = next.saturating_duration_since(Instant::now());
+        match stop.recv_timeout(wait) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
         }
         next += args.interval;
         // If sampling fell behind (e.g. after sleep/hibernate), don't try to catch up.
@@ -113,9 +133,13 @@ pub fn run(args: &MonitorArgs) -> Result<()> {
             max_proc_core: sample.cpu.first().map_or(0.0, |p| p.pct_core),
         };
         let (transition, triggers) = tracker.observe(&observation);
-        if !transition.in_incident() {
-            continue;
-        }
+        let incident = match transition {
+            Transition::Idle => continue,
+            Transition::Ended(incident) => incident,
+            Transition::Started | Transition::Ongoing => {
+                *tracker.current().expect("incident in progress")
+            }
+        };
 
         let ts = local_timestamp();
         if transition == Transition::Started {
@@ -132,13 +156,53 @@ pub fn run(args: &MonitorArgs) -> Result<()> {
         let offenders = select_offenders(sample.cpu, &sample.gpu.processes, &limits, |pid| {
             sample.snapshot.find(pid).map(|e| e.key())
         });
+        let new_processes = recorder
+            .record(&incident, &observation, triggers, &sample, &offenders)
+            .unwrap_or_else(|e| {
+                eprintln!("{ts}  warning: could not record sample: {e}");
+                Vec::new()
+            });
+
         for offender in &offenders {
             print_offender(&sample, &adapters, offender);
+            if let Some(new) = new_processes.iter().find(|n| n.key == offender.key) {
+                print_details(&sample, new);
+            }
         }
+
         if let Transition::Ended(incident) = transition {
-            print_end(&incident, started_at.elapsed());
+            end_incident(&mut recorder, &incident, started_at.elapsed());
+            recorder.forget_exited(sample.snapshot);
         }
     }
+
+    if let Some(incident) = tracker.finish() {
+        end_incident(&mut recorder, &incident, started_at.elapsed());
+    }
+    println!("Stopped.");
+    Ok(())
+}
+
+fn end_incident(recorder: &mut Recorder, incident: &Incident, duration: Duration) {
+    let id = recorder.incident_id();
+    if let Err(e) = recorder.end(incident, now_filetime()) {
+        eprintln!(
+            "{}  warning: could not record incident end: {e}",
+            local_timestamp()
+        );
+    }
+    println!(
+        "{}  INCIDENT END{} after {}s ({} samples, {}): peak CPU {:.1}%, GPU {:.1}%, process {:.1}% of a core",
+        local_timestamp(),
+        id.map(|id| format!(" #{id}")).unwrap_or_default(),
+        duration.as_secs(),
+        incident.samples,
+        incident.triggers,
+        incident.peak_cpu,
+        incident.peak_gpu,
+        incident.peak_proc_core,
+    );
+    println!();
 }
 
 fn print_offender(sample: &Sample<'_>, adapters: &[AdapterInfo], o: &Offender) {
@@ -158,16 +222,52 @@ fn print_offender(sample: &Sample<'_>, adapters: &[AdapterInfo], o: &Offender) {
     );
 }
 
-fn print_end(incident: &Incident, duration: Duration) {
-    println!(
-        "{}  INCIDENT END after {}s ({} samples, {}): peak CPU {:.1}%, GPU {:.1}%, process {:.1}% of a core",
-        local_timestamp(),
-        duration.as_secs(),
-        incident.samples,
-        incident.triggers,
-        incident.peak_cpu,
-        incident.peak_gpu,
-        incident.peak_proc_core,
-    );
-    println!();
+/// Prints the command line, ancestry and user of a process seen for the first time.
+fn print_details(sample: &Sample<'_>, new: &NewProcess) {
+    const INDENT: &str = "            ";
+    if let Some(cmd) = new
+        .details
+        .command_line
+        .as_deref()
+        .filter(|c| !c.is_empty())
+    {
+        println!("{INDENT}cmd:  {}", truncate(cmd, MAX_COMMAND_LINE_CHARS));
+    }
+    let tree: Vec<String> = sample
+        .snapshot
+        .ancestors(new.key)
+        .iter()
+        .map(|k| {
+            let name = sample.snapshot.name_of(k.pid).unwrap_or("?");
+            format!("{name} ({})", k.pid)
+        })
+        .collect();
+    if !tree.is_empty() {
+        println!("{INDENT}tree: <- {}", tree.join(" <- "));
+    }
+    if let Some(user) = &new.details.user {
+        println!("{INDENT}user: {user}");
+    }
+    if let Some(error) = &new.details.error {
+        println!("{INDENT}note: {error}");
+    }
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_long_strings_on_char_boundaries() {
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abcdef", 3), "abc...");
+        assert_eq!(truncate("ééé", 2), "éé...");
+    }
 }

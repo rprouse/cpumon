@@ -1,5 +1,7 @@
 //! Error type for `cpumon-core`.
 
+use std::path::PathBuf;
+
 /// Errors returned by `cpumon-core`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -14,6 +16,21 @@ pub enum Error {
     /// A Win32 or COM call failed.
     #[error(transparent)]
     Windows(#[from] windows::core::Error),
+
+    /// A database operation failed.
+    #[error("database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    /// The database schema is unusable.
+    #[error("{0}")]
+    Schema(String),
+
+    /// A file system operation failed.
+    #[error("{path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Result type for `cpumon-core`.
