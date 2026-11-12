@@ -9,7 +9,8 @@ offending processes to a local SQLite database: their CPU and per-engine GPU usa
 command line, image path, user, and process ancestry up to the root process. It also
 logs them to the console. Report commands then show the worst offenders over time.
 
-> **Status:** in design. See [docs/design.md](docs/design.md) for the full plan.
+> **Status:** early development. The CLI is scaffolded, but the commands are not yet
+> implemented. See [docs/design.md](docs/design.md) for the full plan and roadmap.
 
 ## Planned usage
 

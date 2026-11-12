@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/cpumon-core", "crates/cpumon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Rob Prouse"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

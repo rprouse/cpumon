@@ -203,7 +203,7 @@ a scheduled task at logon with highest privileges, captures everything.
 
 ## Roadmap
 
-1. Workspace scaffold, build verified.
+1. ~~Workspace scaffold, build verified.~~ Done: CLI surface defined, `db path` works.
 2. GPU engine sampler (PDH + instance-name parsing) with a debug print command, to
    investigate the GPU discrepancy first.
 3. Process snapshot, CPU deltas, machine totals.
