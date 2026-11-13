@@ -1,5 +1,7 @@
 # CPU/GPU Monitor
 
+[![CI](https://github.com/rprouse/cpumon/actions/workflows/ci.yml/badge.svg)](https://github.com/rprouse/cpumon/actions/workflows/ci.yml)
+
 A lightweight, Windows-only CLI that monitors CPU and GPU usage and catches the
 processes responsible for high usage. Spikes are often gone by the time Task Manager is
 checked.
@@ -21,9 +23,10 @@ cpumon monitor --interval 2s --cpu 80 --gpu 80 --proc-core 90
 cpumon incidents --since 24h                     # list high-usage episodes
 cpumon show 42 --samples                         # processes, command lines and trees
 cpumon report --since 7d --by root --metric gpu  # worst offenders by application
-cpumon db prune --older-than 30d                 # delete old incidents
+cpumon db prune --older-than 30d                 # delete old incidents (monitor also
+                                                 # does this daily: --retain 30d)
 cpumon install                                   # run the monitor at every logon
-cpumon status                                    # is the logon task running?
+cpumon status                                    # is the logon task running? + log
 cpumon uninstall
 cpumon top / cpumon gpu                          # live diagnostics
 ```
@@ -48,8 +51,10 @@ Prerequisites:
   (VC++ tools and Windows SDK).
 
 ```powershell
-cargo build --release
+cargo build --release   # target\release\cpumon.exe and cpumonw.exe
 ```
+
+Releases with prebuilt executables are published from `v*` tags.
 
 ## License
 

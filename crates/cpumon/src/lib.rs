@@ -72,12 +72,50 @@ enum DbCommand {
 /// Parses the command line and runs the command.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let db = match cli.db {
-        Some(path) => path,
-        None => default_db_path().context("LOCALAPPDATA is not set; pass --db")?,
-    };
+    let db = db_path(cli.db.clone())?;
+    dispatch(cli.command, &db)
+}
 
-    match cli.command {
+/// Entry point for `cpumonw`, which has no console: standard error (warnings and a
+/// final error) is appended to `cpumon.log` next to the database, with timestamps, so
+/// that `cpumon status` can show why the logon task stopped.
+pub fn run_windowless() -> std::process::ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Nowhere to show usage errors; the log location is unknown without --db.
+        Err(_) => return std::process::ExitCode::from(2),
+    };
+    let db = match db_path(cli.db.clone()) {
+        Ok(db) => db,
+        Err(_) => return std::process::ExitCode::FAILURE,
+    };
+    let _ = cpumon_core::console::redirect_stderr(&cpumon_core::paths::log_path(&db));
+    let ts = cpumon_core::time::local_timestamp;
+    eprintln!(
+        "{}  started (pid {}): {}",
+        ts(),
+        std::process::id(),
+        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+    );
+    match dispatch(cli.command, &db) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}  error: {e:#}", ts());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn db_path(db: Option<PathBuf>) -> Result<PathBuf> {
+    match db {
+        Some(path) => Ok(path),
+        None => default_db_path().context("LOCALAPPDATA is not set; pass --db"),
+    }
+}
+
+fn dispatch(command: Command, db: &std::path::Path) -> Result<()> {
+    let db = db.to_path_buf();
+    match command {
         Command::Db(DbCommand::Path) => {
             println!("{}", db.display());
             Ok(())

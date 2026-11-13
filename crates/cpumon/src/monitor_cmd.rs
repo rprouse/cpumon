@@ -15,7 +15,7 @@ use cpumon_core::offenders::{Offender, OffenderLimits, select_offenders};
 use cpumon_core::recorder::{NewProcess, Recorder};
 use cpumon_core::sampler::{Sample, Sampler};
 use cpumon_core::store::Store;
-use cpumon_core::time::{local_timestamp, now_filetime};
+use cpumon_core::time::{filetime_minus, format_utc, local_timestamp, now_filetime};
 use cpumon_core::totals::Health;
 
 use crate::gpu_cmd::adapter_name;
@@ -69,7 +69,14 @@ pub struct MonitorArgs {
     /// normal samples to end any incident
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
     pub sustain: u32,
+
+    /// Delete incidents older than this (checked at start and daily, between incidents)
+    #[arg(long, default_value = "30d", value_parser = parse_duration)]
+    pub retain: Duration,
 }
+
+/// How often the monitor prunes old incidents.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl MonitorArgs {
     fn thresholds(&self) -> Thresholds {
@@ -104,6 +111,7 @@ impl MonitorArgs {
             ("--proc-gpu", self.proc_gpu.to_string()),
             ("--top", self.top.to_string()),
             ("--sustain", self.sustain.to_string()),
+            ("--retain", duration(self.retain)),
         ]
         .into_iter()
         .flat_map(|(flag, value)| [flag.to_owned(), value])
@@ -161,7 +169,12 @@ pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
 
     let mut started_at = Instant::now();
     let mut next = Instant::now() + args.interval;
+    let mut next_prune = Instant::now();
     loop {
+        if tracker.current().is_none() && Instant::now() >= next_prune {
+            prune(recorder.store(), args.retain);
+            next_prune = Instant::now() + PRUNE_EVERY;
+        }
         let wait = next.saturating_duration_since(Instant::now());
         match stop.recv_timeout(wait) {
             Err(RecvTimeoutError::Timeout) => {}
@@ -278,6 +291,22 @@ fn health_line(h: &Health) -> String {
         parts.push(format!("paging {p:.0} pages/s"));
     }
     parts.join("  ")
+}
+
+/// Deletes incidents older than `retain`, and processes no longer referenced.
+fn prune(store: &Store, retain: Duration) {
+    let before = format_utc(filetime_minus(now_filetime(), retain));
+    match store.prune(&before) {
+        Ok(stats) if stats.incidents > 0 || stats.processes > 0 => println!(
+            "{}  Pruned {} incident(s) and {} process record(s) older than {:?}.",
+            local_timestamp(),
+            stats.incidents,
+            stats.processes,
+            retain,
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("{}  warning: pruning failed: {e}", local_timestamp()),
+    }
 }
 
 fn end_incident(recorder: &mut Recorder, incident: &Incident, duration: Duration) {

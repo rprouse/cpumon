@@ -27,15 +27,11 @@ pub(crate) struct CounterArray {
 }
 
 impl CounterArray {
-    /// Opens a query for `path` (an English counter path, e.g.
-    /// `\GPU Engine(*)\Utilization Percentage`) and takes the baseline reading.
-    pub(crate) fn open(path: &str) -> Result<Self> {
-        Self::open_many(&[(path, true)])
-    }
-
-    /// Opens one query for several counters, collected together. Each entry is a path
-    /// and whether it is required; optional counters that cannot be added (e.g. no
-    /// thermal zones) are skipped and read as having no instances.
+    /// Opens one query for several counters, collected together, and takes the
+    /// baseline reading. Each entry is an English counter path (e.g.
+    /// `\GPU Engine(*)\Utilization Percentage`) and whether it is required; optional
+    /// counters that cannot be added (e.g. no thermal zones) are skipped and read as
+    /// having no instances.
     pub(crate) fn open_many(paths: &[(&str, bool)]) -> Result<Self> {
         let mut query = PDH_HQUERY::default();
         // SAFETY: `query` is a valid out pointer; a null data source means live data.

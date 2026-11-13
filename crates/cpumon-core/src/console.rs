@@ -1,15 +1,53 @@
-//! Console stop signal (Ctrl+C, Ctrl+Break, closing the window, logoff, shutdown).
+//! Console handling: the stop signal (Ctrl+C, Ctrl+Break, closing the window, logoff,
+//! shutdown), and sending standard error to a log file when there is no console.
 
+use std::fs::OpenOptions;
+use std::os::windows::io::IntoRawHandle;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Duration;
 
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+    CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, STD_ERROR_HANDLE,
+    SetConsoleCtrlHandler, SetStdHandle,
 };
 use windows::core::BOOL;
 
 use crate::error::{Error, Result};
+
+/// A log larger than this is moved to `<name>.old` before appending.
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Appends everything written to standard error (`eprintln!`, and the error a failing
+/// `main` prints) to `path` for the rest of the process. For processes without a
+/// console, whose standard error otherwise goes nowhere. Rust's standard error looks
+/// up the handle on every write, so this takes effect immediately.
+pub fn redirect_stderr(path: &Path) -> Result<()> {
+    let io = |source| Error::Io {
+        path: path.to_owned(),
+        source,
+    };
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old");
+        let _ = std::fs::rename(path, old);
+    }
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(io)?;
+    // The handle stays open for the life of the process, as standard error.
+    let handle = HANDLE(file.into_raw_handle());
+    // SAFETY: `handle` is an open file handle that is never closed.
+    unsafe { SetStdHandle(STD_ERROR_HANDLE, handle) }?;
+    Ok(())
+}
 
 static STOP: OnceLock<SyncSender<()>> = OnceLock::new();
 

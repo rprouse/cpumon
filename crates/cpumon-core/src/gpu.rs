@@ -276,7 +276,9 @@ impl GpuSampler {
     /// Opens the counters and takes the baseline reading.
     pub fn new() -> Result<Self> {
         Ok(Self {
-            counters: CounterArray::open(GPU_ENGINE_COUNTER)?,
+            // Optional: machines without a WDDM GPU driver (e.g. some VMs and CI
+            // runners) have no GPU Engine counters; GPU usage then reads as zero.
+            counters: CounterArray::open_many(&[(GPU_ENGINE_COUNTER, false)])?,
             engine_types: EngineTypes::default(),
             usages: Vec::new(),
         })

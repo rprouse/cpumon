@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use cpumon_core::paths::log_path;
 use cpumon_core::procinfo::current_user;
 use cpumon_core::task::{self, TASK_NAME, TaskSpec, TaskState};
 
@@ -117,5 +118,44 @@ pub fn status(db: &Path) -> Result<()> {
         None => println!("Scheduled task \"{TASK_NAME}\" is not installed (`cpumon install`)."),
     }
     println!("Database: {}", db.display());
+
+    let log = log_path(db);
+    if let Ok(text) = std::fs::read_to_string(&log) {
+        println!("Log:      {}", log.display());
+        let tail = last_lines(&text, LOG_TAIL_LINES);
+        if !tail.is_empty() {
+            println!();
+            for line in tail {
+                println!("  {line}");
+            }
+        }
+    }
     Ok(())
+}
+
+/// Log lines shown by `status`.
+const LOG_TAIL_LINES: usize = 8;
+
+/// The last `n` non-empty lines of `text`, oldest first.
+fn last_lines(text: &str, n: usize) -> Vec<&str> {
+    let mut lines: Vec<&str> = text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+        .collect();
+    lines.reverse();
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn takes_last_non_empty_lines_in_order() {
+        assert_eq!(last_lines("a\nb\n\nc\n", 2), ["b", "c"]);
+        assert_eq!(last_lines("a\n", 5), ["a"]);
+        assert!(last_lines("", 3).is_empty());
+    }
 }

@@ -111,7 +111,8 @@ hot path.
    original process.
 3. **Per-process GPU**: a persistent PDH query with the wildcard counter
    `\GPU Engine(*)\Utilization Percentage`, read with `PdhGetFormattedCounterArrayW`.
-   Instance names are parsed into PID, adapter LUID, and engine type.
+   Instance names are parsed into PID, adapter LUID, and engine type. Machines without
+   a WDDM GPU driver (some VMs, CI runners) have no such counters; GPU then reads 0.
 4. **Machine totals**: CPU from `\Processor Information(_Total)\% Processor Utility`;
    GPU as max engine per adapter (Task Manager style) plus the sum across engines.
 5. **Responsiveness** (see below): stall time from a probe thread, plus DPC/interrupt
@@ -189,7 +190,10 @@ Location: `%LOCALAPPDATA%\cpumon\cpumon.db` (overridable with `--db`). WAL mode,
 `PRAGMA user_version`; migrations live in `crates/cpumon-core/src/store/schema.rs`.
 `cpumon db prune` (default `--older-than 30d`) deletes incidents that ended before the
 cutoff, with their samples, and then any process rows no longer referenced by a sample
-directly or as an ancestor. Incidents in progress are never pruned.
+(as an offender, a hung window's owner, or an ancestor of either). Incidents in progress
+are never pruned. `monitor` does the same itself with `--retain` (default 30d) at
+startup and then once a day, between incidents, so an unattended logon task keeps the
+database bounded.
 
 Timestamps are fixed-width UTC strings with 100 ns precision, such as
 `2026-11-12T14:05:52.1234567Z`. They sort chronologically and work with SQLite's date
@@ -229,7 +233,7 @@ SELECT name FROM chain ORDER BY depth DESC LIMIT 1;
 ```
 cpumon monitor   [--interval 2s] [--cpu 80] [--gpu 80] [--proc-core 90]
                  [--proc-cpu 10] [--proc-gpu 10] [--top 5] [--stall 500ms] [--dpc 30]
-                 [--sustain 2] [--db PATH]
+                 [--sustain 2] [--retain 30d] [--db PATH]
 cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top 20]
 cpumon incidents [--since 24h]
 cpumon show <incident-id> [--samples]   # processes, command lines, trees; --samples adds the timeline
@@ -308,7 +312,10 @@ Scheduler COM API (no `schtasks.exe`):
 - Trigger: logon of the installing user. Action: `cpumonw.exe` (next to `cpumon.exe`)
   with `--db <absolute path> monitor <the given monitor options>`.
 - `cpumonw.exe` is the same program built for the Windows GUI subsystem, so it runs
-  without a console window; its output is discarded.
+  without a console window. Its normal output is discarded; standard error (a start
+  line, warnings, and the error if it exits) is appended to `cpumon.log` next to the
+  database, rotated to `cpumon.log.old` past 1 MB. `cpumon status` shows the last
+  lines.
 - Principal: that user with the interactive logon type ("run only when the user is
   logged on"), so it runs in the user's session and can see which windows stop
   responding. An earlier version used S4U ("run whether logged on or not"), which
@@ -323,6 +330,14 @@ Scheduler COM API (no `schtasks.exe`):
 
 `cpumon uninstall` stops and deletes the task (the database is kept); `cpumon status`
 reports whether it is installed and running. Reinstall after moving the executables.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy -D warnings` and
+`cargo test` on `windows-latest` for pushes to `main` and pull requests. Pushing a tag
+`v*` also builds a release and attaches `cpumon-<tag>-x86_64-windows.zip` (both
+executables, README, LICENSE) to a GitHub release. Live tests tolerate machines without
+a GPU. Text files are stored and checked out with LF (`.gitattributes`).
 
 ## Roadmap
 
