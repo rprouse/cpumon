@@ -97,6 +97,9 @@ impl Recorder {
                 gpu_sum: sample.gpu.sum(),
                 max_proc_core: observation.max_proc_core,
                 triggers,
+                stall_ms: observation.stall_ms,
+                health: sample.health,
+                hung_windows: sample.hung.len(),
             })?;
             for adapter in &sample.gpu.adapters {
                 let luid = adapter.adapter.to_string();
@@ -134,6 +137,19 @@ impl Recorder {
                         .filter(|e| e.key() == offender.key)
                         .map(|e| e.working_set_bytes as u64),
                 })?;
+            }
+            for window in sample.hung {
+                // A process that exited since the scan cannot be identified reliably.
+                let Some(entry) = sample.snapshot.find(window.pid) else {
+                    continue;
+                };
+                let process_id = writer.offender(entry.key())?;
+                store.insert_hung_window(
+                    sample_id,
+                    process_id,
+                    &window.title,
+                    window.foreground,
+                )?;
             }
             store.update_incident(incident_id, incident, None)?;
             Ok(incident_id)

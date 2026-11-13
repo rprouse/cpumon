@@ -30,9 +30,28 @@ pub struct IncidentSummary {
     pub peak_cpu: f64,
     pub peak_gpu: f64,
     pub peak_proc_core: f64,
+    /// Longest thread wake-up delay, milliseconds (`None` before schema v3).
+    pub peak_stall_ms: Option<f64>,
+    /// Worst single CPU's DPC + interrupt percent (`None` before schema v3).
+    pub peak_dpc: Option<f64>,
     /// Name of the process with the most CPU (capped at one core) plus GPU over the
     /// incident.
     pub top_process: Option<String>,
+    /// Name of the process whose window was not responding in the most samples.
+    pub hung_process: Option<String>,
+}
+
+/// A window that was not responding during an incident.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncidentHungWindow {
+    pub process: ProcessInfo,
+    pub title: String,
+    /// Samples in which it was not responding.
+    pub samples: i64,
+    /// It was the foreground window in at least one of them.
+    pub foreground: bool,
+    pub first_utc: String,
+    pub last_utc: String,
 }
 
 /// A recorded process instance.
@@ -77,6 +96,16 @@ pub struct SampleSummary {
     pub gpu_sum: f64,
     pub max_proc_core: f64,
     pub triggers: String,
+    /// Responsiveness figures; `None` for samples recorded before schema v3 or where
+    /// the counter is unavailable.
+    pub stall_ms: Option<f64>,
+    pub max_core_dpc: Option<f64>,
+    pub cpu_performance: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub memory_available_mb: Option<f64>,
+    pub memory_committed: Option<f64>,
+    pub pages_input_per_sec: Option<f64>,
+    pub hung_windows: Option<i64>,
 }
 
 /// A process's usage within one incident, the unit reports aggregate.
@@ -126,12 +155,22 @@ const INCIDENT_SELECT: &str = "
         FROM process_sample ps
         JOIN sample s ON s.id = ps.sample_id
         JOIN process p ON p.id = ps.process_id
-        GROUP BY s.incident_id, ps.process_id)
+        GROUP BY s.incident_id, ps.process_id),
+    hung AS (
+        SELECT s.incident_id, p.name,
+               ROW_NUMBER() OVER (
+                   PARTITION BY s.incident_id ORDER BY COUNT(*) DESC, p.name
+               ) AS rank
+        FROM sample_hung_window h
+        JOIN sample s ON s.id = h.sample_id
+        JOIN process p ON p.id = h.process_id
+        GROUP BY s.incident_id, h.process_id)
     SELECT i.id, i.started_utc, i.ended_utc, i.triggers, i.samples,
            COALESCE(i.peak_cpu, 0), COALESCE(i.peak_gpu, 0), COALESCE(i.peak_proc_core, 0),
-           r.name
+           r.name, i.peak_stall_ms, i.peak_dpc, h.name
     FROM incident i
-    LEFT JOIN ranked r ON r.incident_id = i.id AND r.rank = 1";
+    LEFT JOIN ranked r ON r.incident_id = i.id AND r.rank = 1
+    LEFT JOIN hung h ON h.incident_id = i.id AND h.rank = 1";
 
 fn incident_from(row: &Row<'_>) -> rusqlite::Result<IncidentSummary> {
     Ok(IncidentSummary {
@@ -144,6 +183,9 @@ fn incident_from(row: &Row<'_>) -> rusqlite::Result<IncidentSummary> {
         peak_gpu: row.get(6)?,
         peak_proc_core: row.get(7)?,
         top_process: row.get(8)?,
+        peak_stall_ms: row.get(9)?,
+        peak_dpc: row.get(10)?,
+        hung_process: row.get(11)?,
     })
 }
 
@@ -168,7 +210,9 @@ impl Store {
         let sql = format!(
             "WITH {SAMPLE_SECONDS}
              SELECT s.ts_utc, ss.seconds, s.cpu_total, s.gpu_max_engine, s.gpu_sum,
-                    s.max_proc_core, s.triggers
+                    s.max_proc_core, s.triggers, s.stall_ms, s.max_core_dpc,
+                    s.cpu_performance, s.temperature_c, s.memory_available_mb,
+                    s.memory_committed, s.pages_input_per_sec, s.hung_windows
              FROM sample s JOIN sample_seconds ss ON ss.id = s.id
              WHERE s.incident_id = ?1
              ORDER BY s.ts_utc"
@@ -183,6 +227,40 @@ impl Store {
                 gpu_sum: r.get(4)?,
                 max_proc_core: r.get(5)?,
                 triggers: r.get(6)?,
+                stall_ms: r.get(7)?,
+                max_core_dpc: r.get(8)?,
+                cpu_performance: r.get(9)?,
+                temperature_c: r.get(10)?,
+                memory_available_mb: r.get(11)?,
+                memory_committed: r.get(12)?,
+                pages_input_per_sec: r.get(13)?,
+                hung_windows: r.get(14)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Windows that were not responding during an incident, longest first.
+    pub fn incident_hung_windows(&self, incident_id: i64) -> Result<Vec<IncidentHungWindow>> {
+        let sql = format!(
+            "SELECT {PROCESS_COLUMNS}, h.title, COUNT(*), MAX(h.foreground),
+                    MIN(s.ts_utc), MAX(s.ts_utc)
+             FROM sample_hung_window h
+             JOIN sample s ON s.id = h.sample_id
+             JOIN process p ON p.id = h.process_id
+             WHERE s.incident_id = ?1
+             GROUP BY h.process_id, h.title
+             ORDER BY COUNT(*) DESC, p.name"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([incident_id], |r| {
+            Ok(IncidentHungWindow {
+                process: process_from(r, 0)?,
+                title: r.get(9)?,
+                samples: r.get(10)?,
+                foreground: r.get(11)?,
+                first_utc: r.get(12)?,
+                last_utc: r.get(13)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -307,7 +385,9 @@ impl Store {
             )?;
             let processes = store.conn.execute(
                 "WITH RECURSIVE keep(id) AS (
-                     SELECT DISTINCT process_id FROM process_sample
+                     SELECT process_id FROM process_sample
+                     UNION
+                     SELECT process_id FROM sample_hung_window
                      UNION
                      SELECT p.parent_process_id FROM process p JOIN keep k ON p.id = k.id
                      WHERE p.parent_process_id IS NOT NULL)
@@ -329,6 +409,7 @@ mod tests {
     use crate::gpu::Luid;
     use crate::incident::{Incident, Triggers};
     use crate::store::{ProcessRow, ProcessSampleRow, SampleRow};
+    use crate::totals::Health;
 
     const T0: &str = "2026-01-01T00:00:00.0000000Z";
     const T1: &str = "2026-01-01T00:00:02.0000000Z";
@@ -367,6 +448,9 @@ mod tests {
                     gpu: true,
                     ..Triggers::default()
                 },
+                stall_ms: 0.0,
+                health: Health::default(),
+                hung_windows: 0,
             })
             .unwrap();
         if interval_s.is_none() {
@@ -404,6 +488,7 @@ mod tests {
             peak_cpu: 50.0,
             peak_gpu: 90.0,
             peak_proc_core: 100.0,
+            ..Incident::default()
         };
         store.update_incident(id, &incident, Some(at)).unwrap();
     }
@@ -533,6 +618,67 @@ mod tests {
         let recent = f.store.process_usage_since(T2).unwrap();
         assert!(recent.iter().all(|u| u.samples == 1));
         assert_eq!(f.store.processes().unwrap().len(), 4);
+    }
+
+    fn first_sample(store: &Store, incident: i64) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT MIN(id) FROM sample WHERE incident_id = ?1",
+                [incident],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn lists_hung_windows_and_names_the_hung_process() {
+        let f = fixture();
+        let frozen = process(&f.store, 60, "frozen.exe", Some(f.explorer));
+        let s1 = first_sample(&f.store, f.incident);
+        f.store
+            .insert_hung_window(s1, frozen, "Meeting", false)
+            .unwrap();
+        // The same window again in this sample, now in the foreground: merged.
+        f.store
+            .insert_hung_window(s1, frozen, "Meeting", true)
+            .unwrap();
+        f.store
+            .insert_hung_window(s1 + 1, frozen, "Meeting", false)
+            .unwrap();
+
+        let hung = f.store.incident_hung_windows(f.incident).unwrap();
+        assert_eq!(hung.len(), 1);
+        assert_eq!(hung[0].process.name, "frozen.exe");
+        assert_eq!((hung[0].samples, hung[0].foreground), (2, true));
+        assert_eq!(
+            (hung[0].first_utc.as_str(), hung[0].last_utc.as_str()),
+            (T1, T2)
+        );
+
+        let incident = f.store.incident(f.incident).unwrap().unwrap();
+        assert_eq!(incident.hung_process.as_deref(), Some("frozen.exe"));
+        // Peaks written by update_incident (schema v3).
+        assert_eq!(incident.peak_stall_ms, Some(0.0));
+
+        // A process seen only as a hung window survives pruning while its incident does.
+        let open = f.store.insert_incident(LATER).unwrap();
+        let s = sample(&f.store, open, LATER, Some(2.0));
+        f.store
+            .insert_hung_window(s, frozen, "Meeting", false)
+            .unwrap();
+        f.store.prune("2026-01-15T00:00:00.0000000Z").unwrap();
+        assert!(f.store.processes().unwrap().contains_key(&frozen));
+    }
+
+    #[test]
+    fn reads_responsiveness_columns_of_samples() {
+        let f = fixture();
+        let samples = f.store.incident_samples(f.incident).unwrap();
+        assert_eq!(samples[0].stall_ms, Some(0.0));
+        assert_eq!(samples[0].hung_windows, Some(0));
+        // Health::default() has no memory reading.
+        assert_eq!(samples[0].memory_available_mb, None);
     }
 
     #[test]

@@ -4,7 +4,8 @@ mod queries;
 mod schema;
 
 pub use queries::{
-    IncidentProcess, IncidentSummary, ProcessInfo, ProcessUsage, PruneStats, SampleSummary,
+    IncidentHungWindow, IncidentProcess, IncidentSummary, ProcessInfo, ProcessUsage, PruneStats,
+    SampleSummary,
 };
 
 use std::path::Path;
@@ -14,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::adapters::AdapterInfo;
 use crate::error::{Error, Result};
 use crate::incident::{Incident, Triggers};
+use crate::totals::Health;
 
 /// A new `sample` row.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +29,10 @@ pub struct SampleRow<'a> {
     pub gpu_sum: f64,
     pub max_proc_core: f64,
     pub triggers: Triggers,
+    /// Longest thread wake-up delay, milliseconds.
+    pub stall_ms: f64,
+    pub health: Health,
+    pub hung_windows: usize,
 }
 
 /// A new `sample_gpu_engine` row.
@@ -194,7 +200,8 @@ impl Store {
             .prepare_cached(
                 "UPDATE incident
                  SET triggers = ?2, samples = ?3, peak_cpu = ?4, peak_gpu = ?5,
-                     peak_proc_core = ?6, ended_utc = COALESCE(?7, ended_utc)
+                     peak_proc_core = ?6, ended_utc = COALESCE(?7, ended_utc),
+                     peak_stall_ms = ?8, peak_dpc = ?9, peak_hung_windows = ?10
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -205,6 +212,9 @@ impl Store {
                 incident.peak_gpu,
                 incident.peak_proc_core,
                 ended_utc,
+                incident.peak_stall_ms,
+                incident.peak_dpc,
+                incident.peak_hung_windows as i64,
             ])?;
         Ok(())
     }
@@ -213,8 +223,12 @@ impl Store {
         self.conn
             .prepare_cached(
                 "INSERT INTO sample (incident_id, ts_utc, cpu_total, gpu_max_engine, gpu_sum,
-                                     max_proc_core, triggers, interval_s)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                     max_proc_core, triggers, interval_s, stall_ms, dpc_pct,
+                                     interrupt_pct, max_core_dpc, cpu_performance,
+                                     temperature_c, memory_available_mb, memory_committed,
+                                     pages_input_per_sec, hung_windows)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18)",
             )?
             .execute(params![
                 row.incident_id,
@@ -225,8 +239,36 @@ impl Store {
                 row.max_proc_core,
                 row.triggers.to_string(),
                 row.interval_s,
+                row.stall_ms,
+                row.health.dpc,
+                row.health.interrupt,
+                row.health.max_core_dpc,
+                row.health.cpu_performance,
+                row.health.temperature_c,
+                row.health.memory_available_mb,
+                row.health.memory_committed,
+                row.health.pages_input_per_sec,
+                row.hung_windows as i64,
             ])?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Records a window that was not responding at the time of a sample.
+    pub fn insert_hung_window(
+        &self,
+        sample_id: i64,
+        process_id: i64,
+        title: &str,
+        foreground: bool,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO sample_hung_window (sample_id, process_id, title, foreground)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT DO UPDATE SET foreground = MAX(foreground, excluded.foreground)",
+            )?
+            .execute(params![sample_id, process_id, title, foreground])?;
+        Ok(())
     }
 
     pub fn insert_engine(&self, row: &EngineRow<'_>) -> Result<()> {
@@ -334,7 +376,7 @@ mod tests {
     #[test]
     fn migrates_new_database_to_latest() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -348,7 +390,7 @@ mod tests {
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
         let count: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM incident", [], |r| r.get(0))
@@ -374,13 +416,14 @@ mod tests {
         let incident = Incident {
             triggers: Triggers {
                 cpu: true,
-                gpu: false,
                 core: true,
+                ..Triggers::default()
             },
             samples: 3,
             peak_cpu: 90.0,
             peak_gpu: 10.0,
             peak_proc_core: 100.0,
+            ..Incident::default()
         };
         store.update_incident(id, &incident, None).unwrap();
         let (triggers, ended): (String, Option<String>) = store
@@ -426,6 +469,9 @@ mod tests {
                     gpu_sum: 3.0,
                     max_proc_core: 4.0,
                     triggers: Triggers::default(),
+                    stall_ms: 0.0,
+                    health: Health::default(),
+                    hung_windows: 0,
                 })
                 .unwrap();
         }
@@ -516,6 +562,9 @@ mod tests {
                     gpu: true,
                     ..Triggers::default()
                 },
+                stall_ms: 0.0,
+                health: Health::default(),
+                hung_windows: 0,
             })
             .unwrap();
         store

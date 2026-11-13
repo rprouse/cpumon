@@ -3,7 +3,7 @@
 //! Each entry upgrades the schema from version `i` to `i + 1`. Never edit a migration
 //! that has shipped; add a new one instead.
 
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// Initial schema. All `*_utc` columns hold fixed-width UTC strings such as
 /// `2026-11-12T14:05:52.1234567Z`.
@@ -85,4 +85,33 @@ CREATE INDEX process_sample_process ON process_sample (process_id);
 /// before this migration have NULL and fall back to the gap since the previous sample.
 const V2: &str = r"
 ALTER TABLE sample ADD COLUMN interval_s REAL;
+";
+
+/// Responsiveness: stall time, DPC/interrupt time, CPU speed, temperature and memory
+/// per sample, their peaks per incident, and windows that stopped responding.
+const V3: &str = r"
+ALTER TABLE incident ADD COLUMN peak_stall_ms REAL;
+ALTER TABLE incident ADD COLUMN peak_dpc REAL;
+ALTER TABLE incident ADD COLUMN peak_hung_windows INTEGER;
+
+ALTER TABLE sample ADD COLUMN stall_ms REAL;            -- longest thread wake-up delay
+ALTER TABLE sample ADD COLUMN dpc_pct REAL;             -- % of machine
+ALTER TABLE sample ADD COLUMN interrupt_pct REAL;       -- % of machine
+ALTER TABLE sample ADD COLUMN max_core_dpc REAL;        -- worst CPU: DPC + interrupt %
+ALTER TABLE sample ADD COLUMN cpu_performance REAL;     -- % of base frequency
+ALTER TABLE sample ADD COLUMN temperature_c REAL;
+ALTER TABLE sample ADD COLUMN memory_available_mb REAL;
+ALTER TABLE sample ADD COLUMN memory_committed REAL;    -- % of commit limit
+ALTER TABLE sample ADD COLUMN pages_input_per_sec REAL; -- hard-fault reads
+ALTER TABLE sample ADD COLUMN hung_windows INTEGER;
+
+-- Visible windows not responding at the time of a sample.
+CREATE TABLE sample_hung_window (
+    sample_id  INTEGER NOT NULL REFERENCES sample (id) ON DELETE CASCADE,
+    process_id INTEGER NOT NULL REFERENCES process (id),
+    title      TEXT NOT NULL,
+    foreground INTEGER NOT NULL,
+    PRIMARY KEY (sample_id, process_id, title)
+) WITHOUT ROWID;
+CREATE INDEX sample_hung_window_process ON sample_hung_window (process_id);
 ";

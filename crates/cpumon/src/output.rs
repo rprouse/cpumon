@@ -66,6 +66,15 @@ pub fn elapsed(from_utc: &str, to_utc: &str) -> Option<String> {
     Some(seconds((to - from).max(0) as f64 / 10_000_000.0))
 }
 
+/// Milliseconds, e.g. `850 ms`, or seconds from 10 s up, e.g. `12.3 s`.
+pub fn millis(ms: f64) -> String {
+    if ms < 10_000.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{:.1} s", ms / 1000.0)
+    }
+}
+
 pub fn percent(p: f64) -> String {
     format!("{p:.1}%")
 }
@@ -102,6 +111,13 @@ mod tests {
             Some("1m 30s")
         );
         assert_eq!(elapsed("bad", "2026-01-01T00:00:00.0000000Z"), None);
+    }
+
+    #[test]
+    fn formats_millis() {
+        assert_eq!(millis(15.4), "15 ms");
+        assert_eq!(millis(9_999.0), "9999 ms");
+        assert_eq!(millis(12_345.0), "12.3 s");
     }
 
     #[test]

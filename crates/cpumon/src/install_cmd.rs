@@ -30,6 +30,14 @@ pub struct InstallArgs {
 
 pub fn install(args: &InstallArgs, db: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("finding cpumon.exe")?;
+    // The task runs the windowless build, which sits next to this one.
+    let exe = exe.with_file_name("cpumonw.exe");
+    if !exe.is_file() {
+        bail!(
+            "{} not found. It is built alongside cpumon.exe; keep the two together.",
+            exe.display()
+        );
+    }
     let user = current_user().context("finding the current user")?;
     let db = std::path::absolute(db).context("resolving the database path")?;
     let mut arguments = format!("--db \"{}\" monitor", db.display());
@@ -48,8 +56,14 @@ pub fn install(args: &InstallArgs, db: &Path) -> Result<()> {
         Ok(state) => state,
         Err(cpumon_core::Error::Windows(e)) if e.code().0 == E_ACCESSDENIED => {
             bail!(
-                "Task Scheduler refused the task (access denied). Installing needs an \
-                 elevated terminal, e.g. `sudo cpumon install`."
+                "Task Scheduler refused the task (access denied). Run it from an elevated \
+                 terminal, e.g. `sudo cpumon install`{}.",
+                if args.elevated {
+                    " (always needed with --elevated)"
+                } else {
+                    ", or replace a task installed by an older version with \
+                     `sudo cpumon uninstall` first"
+                }
             );
         }
         Err(e) => return Err(e).context("registering the scheduled task"),
@@ -61,15 +75,15 @@ pub fn install(args: &InstallArgs, db: &Path) -> Result<()> {
         if args.elevated { " (elevated)" } else { "" }
     );
     println!("  runs:  \"{}\" {}", spec.command, spec.arguments);
-    println!("  when:  at logon, without a window; restarted if it fails");
+    println!("  when:  at your logon, in your session without a window; restarted if it fails");
     println!("  state: {state}");
     if exe.components().any(|c| c.as_os_str() == "target") {
         println!(
             "Note: this is a build output; the task stops working if `cargo clean` removes it. \
-             Copy cpumon.exe somewhere permanent and install from there."
+             Copy cpumon.exe and cpumonw.exe somewhere permanent and install from there."
         );
     }
-    println!("Remove with `sudo cpumon uninstall`.");
+    println!("Remove with `cpumon uninstall`.");
     Ok(())
 }
 
@@ -77,7 +91,10 @@ pub fn uninstall() -> Result<()> {
     let removed = match task::uninstall() {
         Ok(removed) => removed,
         Err(cpumon_core::Error::Windows(e)) if e.code().0 == E_ACCESSDENIED => {
-            bail!("access denied. Run `sudo cpumon uninstall` from an elevated terminal.");
+            bail!(
+                "access denied. Tasks installed with --elevated or by an older version need \
+                 an elevated terminal: `sudo cpumon uninstall`."
+            );
         }
         Err(e) => return Err(e).context("removing the scheduled task"),
     };

@@ -1,9 +1,11 @@
 //! Running `cpumon monitor` at logon through Task Scheduler.
 //!
-//! The task runs as the current user with the S4U logon type ("run whether the user
-//! is logged on or not", no password stored). Such tasks run without a desktop, so no
-//! console window appears. Registration uses the Task Scheduler COM API rather than
-//! `schtasks.exe`.
+//! The task runs as the current user with the interactive logon type ("run only when
+//! the user is logged on"), in the user's session, so the monitor can see which of the
+//! user's windows stop responding. The command should be the windowless `cpumonw.exe`
+//! so that no console window appears. (An S4U task would avoid the window too, but it
+//! runs in session 0 and cannot see the user's desktop.) Registration uses the Task
+//! Scheduler COM API rather than `schtasks.exe`.
 
 use std::fmt::Write as _;
 
@@ -11,8 +13,9 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::TaskScheduler::{
-    IRegisteredTask, ITaskFolder, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_S4U, TASK_STATE,
-    TASK_STATE_DISABLED, TASK_STATE_QUEUED, TASK_STATE_READY, TASK_STATE_RUNNING, TaskScheduler,
+    IRegisteredTask, ITaskFolder, ITaskService, TASK_CREATE_OR_UPDATE,
+    TASK_LOGON_INTERACTIVE_TOKEN, TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_QUEUED,
+    TASK_STATE_READY, TASK_STATE_RUNNING, TaskScheduler,
 };
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::BSTR;
@@ -27,7 +30,7 @@ pub const TASK_NAME: &str = "cpumon";
 pub struct TaskSpec {
     /// `DOMAIN\user` to run as and whose logon starts the task.
     pub user: String,
-    /// Full path of `cpumon.exe`.
+    /// Full path of the executable (normally the windowless `cpumonw.exe`).
     pub command: String,
     /// Command-line arguments, already quoted.
     pub arguments: String,
@@ -112,7 +115,7 @@ pub fn task_xml(spec: &TaskSpec) -> String {
   <Principals>
     <Principal id="Author">
       <UserId>{user}</UserId>
-      <LogonType>S4U</LogonType>
+      <LogonType>InteractiveToken</LogonType>
       <RunLevel>{run_level}</RunLevel>
     </Principal>
   </Principals>
@@ -208,7 +211,7 @@ pub fn install(spec: &TaskSpec, start: bool) -> Result<TaskState> {
             TASK_CREATE_OR_UPDATE.0,
             &user,
             &empty,
-            TASK_LOGON_S4U,
+            TASK_LOGON_INTERACTIVE_TOKEN,
             &empty,
         )
     }?;
@@ -268,7 +271,7 @@ mod tests {
         let xml = task_xml(&spec());
         assert!(xml.contains(r"<UserId>PC\me</UserId>"));
         assert_eq!(xml.matches(r"<UserId>PC\me</UserId>").count(), 2);
-        assert!(xml.contains("<LogonType>S4U</LogonType>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(xml.contains(r"<Command>C:\Tools &amp; Things\cpumon.exe</Command>"));
         assert!(xml.contains("<Arguments>monitor --db &quot;C:\\Users"));

@@ -1,9 +1,11 @@
 //! Thin wrapper over the PDH performance counter API for wildcard counters.
 
 use windows::Win32::System::Performance::{
-    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT, PDH_FMT_COUNTERVALUE_ITEM_W,
-    PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PDH_NO_DATA, PdhAddEnglishCounterW,
-    PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
+    PDH_CSTATUS_ITEM_NOT_VALIDATED, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE,
+    PDH_CSTATUS_VALID_DATA, PDH_FMT, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER,
+    PDH_HQUERY, PDH_MORE_DATA, PDH_NO_DATA, PDH_RETRY, PdhAddEnglishCounterW, PdhCloseQuery,
+    PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -12,14 +14,13 @@ use crate::error::{Error, Result};
 /// Report raw values instead of capping them at 100 (missing from the `windows` crate).
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 const ERROR_SUCCESS: u32 = 0;
-/// `PDH_CSTATUS_NO_INSTANCE`: no instance currently exists for a wildcard counter.
-const PDH_CSTATUS_NO_INSTANCE: u32 = 0x800007D1;
 
-/// A PDH query holding one wildcard counter, whose instances are re-read on every
-/// collection. Buffers are reused between collections.
+/// A PDH query holding one or more (usually wildcard) counters, whose instances are
+/// re-read on every collection. Buffers are reused between collections.
 pub(crate) struct CounterArray {
     query: PDH_HQUERY,
-    counter: PDH_HCOUNTER,
+    /// `None` for optional counters that do not exist on this machine.
+    counters: Vec<Option<PDH_HCOUNTER>>,
     /// Item buffer; `u64` elements keep it aligned for `PDH_FMT_COUNTERVALUE_ITEM_W`.
     buffer: Vec<u64>,
     name: String,
@@ -29,6 +30,13 @@ impl CounterArray {
     /// Opens a query for `path` (an English counter path, e.g.
     /// `\GPU Engine(*)\Utilization Percentage`) and takes the baseline reading.
     pub(crate) fn open(path: &str) -> Result<Self> {
+        Self::open_many(&[(path, true)])
+    }
+
+    /// Opens one query for several counters, collected together. Each entry is a path
+    /// and whether it is required; optional counters that cannot be added (e.g. no
+    /// thermal zones) are skipped and read as having no instances.
+    pub(crate) fn open_many(paths: &[(&str, bool)]) -> Result<Self> {
         let mut query = PDH_HQUERY::default();
         // SAFETY: `query` is a valid out pointer; a null data source means live data.
         check("PdhOpenQueryW", unsafe {
@@ -37,16 +45,22 @@ impl CounterArray {
         // From here `Drop` closes the query, including on error.
         let mut this = Self {
             query,
-            counter: PDH_HCOUNTER::default(),
+            counters: Vec::with_capacity(paths.len()),
             buffer: Vec::new(),
             name: String::new(),
         };
-        let path = HSTRING::from(path);
-        // SAFETY: `this.query` is open, `path` is NUL-terminated and outlives the call,
-        // and `this.counter` is a valid out pointer.
-        check("PdhAddEnglishCounterW", unsafe {
-            PdhAddEnglishCounterW(this.query, &path, 0, &mut this.counter)
-        })?;
+        for &(path, required) in paths {
+            let path = HSTRING::from(path);
+            let mut counter = PDH_HCOUNTER::default();
+            // SAFETY: `this.query` is open, `path` is NUL-terminated and outlives the
+            // call, and `counter` is a valid out pointer.
+            let status = unsafe { PdhAddEnglishCounterW(this.query, &path, 0, &mut counter) };
+            match check("PdhAddEnglishCounterW", status) {
+                Ok(()) => this.counters.push(Some(counter)),
+                Err(_) if !required => this.counters.push(None),
+                Err(e) => return Err(e),
+            }
+        }
         this.collect_raw()?;
         Ok(this)
     }
@@ -61,11 +75,25 @@ impl CounterArray {
         check("PdhCollectQueryData", status)
     }
 
-    /// Collects new data and calls `f(instance_name, value)` for each instance with a
-    /// valid value. Rates are averaged over the time since the previous collection.
-    /// Returns the number of instances PDH reported.
-    pub(crate) fn collect(&mut self, mut f: impl FnMut(&str, f64)) -> Result<usize> {
+    /// Collects new data and calls `f(instance_name, value)` for each instance of the
+    /// first counter with a valid value. Rates are averaged over the time since the
+    /// previous collection. Returns the number of instances PDH reported.
+    pub(crate) fn collect(&mut self, f: impl FnMut(&str, f64)) -> Result<usize> {
         self.collect_raw()?;
+        self.read(0, f)
+    }
+
+    /// Collects new data for all counters; read each one with [`read`](Self::read).
+    pub(crate) fn collect_all(&mut self) -> Result<()> {
+        self.collect_raw()
+    }
+
+    /// Calls `f(instance_name, value)` for each valid instance of counter `index` as
+    /// of the last collection. Returns the number of instances PDH reported.
+    pub(crate) fn read(&mut self, index: usize, mut f: impl FnMut(&str, f64)) -> Result<usize> {
+        let Some(Some(counter)) = self.counters.get(index).copied() else {
+            return Ok(0);
+        };
         let format = PDH_FMT(PDH_FMT_DOUBLE.0 | PDH_FMT_NOCAP100);
         let count = loop {
             let mut size_bytes =
@@ -83,13 +111,7 @@ impl CounterArray {
             // SAFETY: `items` is either None or points to `size_bytes` writable bytes,
             // aligned to 8 bytes; both out pointers are valid.
             let status = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    self.counter,
-                    format,
-                    &mut size_bytes,
-                    &mut count,
-                    items,
-                )
+                PdhGetFormattedCounterArrayW(counter, format, &mut size_bytes, &mut count, items)
             };
             match status {
                 ERROR_SUCCESS => break count as usize,
@@ -98,7 +120,15 @@ impl CounterArray {
                     let needed = (size_bytes as usize).div_ceil(size_of::<u64>());
                     self.buffer.resize(needed + needed / 4 + 64, 0);
                 }
-                PDH_NO_DATA | PDH_CSTATUS_NO_INSTANCE => return Ok(0),
+                // No value this time: no instances, not yet validated, or a rate that
+                // could not be computed (counter reset, clock change).
+                PDH_NO_DATA
+                | PDH_CSTATUS_NO_INSTANCE
+                | PDH_CSTATUS_ITEM_NOT_VALIDATED
+                | PDH_RETRY
+                | PDH_CALC_NEGATIVE_DENOMINATOR
+                | PDH_CALC_NEGATIVE_TIMEBASE
+                | PDH_CALC_NEGATIVE_VALUE => return Ok(0),
                 status => {
                     return Err(Error::Pdh {
                         call: "PdhGetFormattedCounterArrayW",

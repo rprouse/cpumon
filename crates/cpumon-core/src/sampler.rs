@@ -3,9 +3,13 @@
 
 use crate::cpu::{CpuTracker, ProcessCpu, logical_cpu_count};
 use crate::error::Result;
+use std::time::Duration;
+
 use crate::gpu::{EngineTypes, GpuSampler, GpuSummary, summarize};
+use crate::hung::{HungWindow, HungWindowScanner};
 use crate::snapshot::ProcessSnapshot;
-use crate::totals::MachineCpu;
+use crate::stall::StallProbe;
+use crate::totals::{Health, MachineCpu};
 
 /// Everything measured in one interval.
 #[derive(Debug)]
@@ -22,6 +26,13 @@ pub struct Sample<'a> {
     pub engine_types: &'a EngineTypes,
     /// The processes at the end of the interval, for names and ancestry.
     pub snapshot: &'a ProcessSnapshot,
+    /// DPC/interrupt time, CPU speed, temperature and memory over the interval.
+    pub health: Health,
+    /// The longest a normal-priority thread was kept waiting during the interval
+    /// (see [`crate::stall`]).
+    pub stall: Duration,
+    /// Visible windows that are not responding, at the end of the interval.
+    pub hung: &'a [HungWindow],
 }
 
 /// Samples CPU and GPU usage. Create once, then call [`sample`](Self::sample) every
@@ -35,6 +46,9 @@ pub struct Sampler {
     gpu_summary: GpuSummary,
     logical_cpus: u32,
     previous_time: i64,
+    /// `None` if the probe thread could not be started; stalls then read as zero.
+    stall: Option<StallProbe>,
+    hung: HungWindowScanner,
 }
 
 impl Sampler {
@@ -55,6 +69,8 @@ impl Sampler {
             gpu_summary: GpuSummary::default(),
             logical_cpus,
             previous_time,
+            stall: StallProbe::start().ok(),
+            hung: HungWindowScanner::new(),
         })
     }
 
@@ -66,7 +82,11 @@ impl Sampler {
     /// Measures usage since the previous sample.
     pub fn sample(&mut self) -> Result<Sample<'_>> {
         // Take the readings back to back so they cover the same interval.
-        let cpu_total = self.machine_cpu.sample()?;
+        let stall = self
+            .stall
+            .as_ref()
+            .map_or(Duration::ZERO, StallProbe::take_max);
+        let (cpu_total, health) = self.machine_cpu.sample()?;
         let gpu = self.gpu.sample()?;
         self.gpu_summary = summarize(gpu.usages);
         self.snapshot.refresh()?;
@@ -81,6 +101,9 @@ impl Sampler {
             gpu: &self.gpu_summary,
             engine_types: self.gpu.engine_types(),
             snapshot: &self.snapshot,
+            health,
+            stall,
+            hung: self.hung.scan(),
         })
     }
 }

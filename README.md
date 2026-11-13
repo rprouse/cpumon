@@ -22,14 +22,18 @@ cpumon incidents --since 24h                     # list high-usage episodes
 cpumon show 42 --samples                         # processes, command lines and trees
 cpumon report --since 7d --by root --metric gpu  # worst offenders by application
 cpumon db prune --older-than 30d                 # delete old incidents
-sudo cpumon install                              # run the monitor at every logon (admin)
+cpumon install                                   # run the monitor at every logon
 cpumon status                                    # is the logon task running?
-sudo cpumon uninstall
+cpumon uninstall
 cpumon top / cpumon gpu                          # live diagnostics
 ```
 
 An incident starts when total CPU or GPU (busiest engine) stays at or above its
-threshold, or one process uses most of a core, for `--sustain` samples in a row.
+threshold, or one process uses most of a core, for `--sustain` samples in a row. It
+starts at once when the machine stalls (a thread is kept waiting for `--stall`,
+default 500 ms), a CPU is swamped by driver DPCs/interrupts, or a window stops
+responding. Each recorded sample also notes CPU speed, temperature, free memory and
+paging, and `cpumon show` names the program whose window hung.
 
 The database is stored at `%LOCALAPPDATA%\cpumon\cpumon.db` (`cpumon db path`).
 Run from an elevated terminal to capture command lines of system processes.

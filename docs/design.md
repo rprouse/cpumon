@@ -79,10 +79,15 @@ crates/
       time.rs              FILETIME <-> UTC strings, local display time
       recorder.rs          writes incidents, samples, offenders and ancestry
       console.rs           Ctrl+C / close handling
+      stall.rs             probe thread measuring wake-up lateness
+      hung.rs              windows that stopped responding
       task.rs              logon task (Task Scheduler COM API)
       store/               SQLite schema, migrations, inserts, report queries, pruning
-  cpumon/                  the `cpumon` binary (CLI, console output)
+  cpumon/                  the CLI (library) and two executables
     src/
+      lib.rs               argument parsing and dispatch
+      main.rs              cpumon.exe (console)
+      bin/cpumonw.rs       cpumonw.exe (no console window, for the logon task)
       monitor_cmd.rs       monitor
       report_cmd.rs        report
       incidents_cmd.rs     incidents, show
@@ -109,33 +114,73 @@ hot path.
    Instance names are parsed into PID, adapter LUID, and engine type.
 4. **Machine totals**: CPU from `\Processor Information(_Total)\% Processor Utility`;
    GPU as max engine per adapter (Task Manager style) plus the sum across engines.
-5. **Triggers**: a sample is high when any of these fire:
+5. **Responsiveness** (see below): stall time from a probe thread, plus DPC/interrupt
+   time, CPU speed, temperature and memory from the same PDH query as the CPU total,
+   and a scan for windows that stopped responding.
+6. **Triggers**: a sample is high when any of these fire:
    - **cpu**: total CPU >= `--cpu` (default 80%);
    - **gpu**: busiest GPU engine >= `--gpu` (default 80%);
    - **core**: any single process >= `--proc-core` percent of one core (default 90%).
      One pegged core on a 16-thread machine is only ~6% of the total, so a runaway
      thread would never reach the total CPU threshold.
+   - **stall**: a normal-priority thread was kept waiting >= `--stall` (default 500 ms);
+   - **dpc**: one logical CPU spent >= `--dpc` percent (default 30%) in DPCs and
+     interrupts;
+   - **hung**: a visible window is not responding.
 
-   After `--sustain` consecutive high samples an **incident** opens. While it is open,
+   The load triggers (cpu, gpu, core) open an **incident** after `--sustain`
+   consecutive high samples. The responsiveness triggers (stall, dpc, hung) open one on
+   a single sample, because the freezes they catch are often shorter than two
+   intervals. While an incident is open,
    every sample records the offenders: each process over `--proc-cpu` (% of machine),
    `--proc-core` or `--proc-gpu`, plus the top `--top` CPU and GPU users. Offenders
    are ranked by their share of one core (capped at 100) or busiest GPU engine,
    whichever is higher, then by raw CPU.
-6. **Enrichment** (once per `(pid, create_time)`, cached): open the process with
+7. **Enrichment** (once per `(pid, create_time)`, cached): open the process with
    `PROCESS_QUERY_LIMITED_INFORMATION` and read the command line via
    `NtQueryInformationProcess(ProcessCommandLineInformation)`, the full image path via
    `QueryFullProcessImageNameW`, plus the user and session. Failures (for example
    access denied for elevated or protected processes when not running as admin) are
    recorded rather than treated as errors.
-7. **Ancestry**: walk parent PIDs through the current snapshot. A candidate parent is
+8. **Ancestry**: walk parent PIDs through the current snapshot. A candidate parent is
    only accepted if its create time is earlier than the child's; otherwise the PID was
    reused and the chain stops. Every ancestor is persisted so the tree survives after
    processes exit.
-8. The incident closes after `--sustain` consecutive normal samples, so brief dips
+9. The incident closes after `--sustain` consecutive normal samples, so brief dips
    neither end nor split it.
 
 The previous snapshot is kept in memory every interval, so a per-process CPU delta is
 always available the moment a spike is detected.
+
+### Responsiveness signals
+
+The machine can freeze without high CPU or GPU percentages, for example when a driver
+holds the CPUs, the system is paging, or the desktop GPU is saturated. These signals
+catch that:
+
+- **Stall** (`stall.rs`): a thread wakes every 250 ms and records how late it woke;
+  each sample takes the worst lateness since the previous one. Normal-priority threads
+  are all delayed when the machine is starved, so this measures what the user feels,
+  and its short period catches freezes far shorter than the sampling interval. Idle
+  baseline is 12-16 ms (timer granularity). Lateness over 30 s is taken as
+  sleep/hibernate and ignored.
+- **DPC and interrupt time** (`totals.rs`): `\Processor Information(*)\% DPC Time` and
+  `% Interrupt Time`, both for the machine and for the worst single logical CPU, which
+  is where a misbehaving driver (audio, USB, Wi-Fi, webcam, GPU) shows. Idle baseline
+  on the development laptop: worst CPU 3-13%.
+- **CPU speed** (`% Processor Performance`, percent of base frequency; well under 100
+  while busy suggests thermal or power throttling) and **temperature** (hottest ACPI
+  thermal zone; missing on many laptops, including the development one). Recorded, not
+  triggers.
+- **Memory**: available MB, committed % and hard-fault reads (`Pages Input/sec`).
+  Recorded, not triggers.
+- **Hung windows** (`hung.rs`): `EnumWindows` + `IsHungAppWindow` each sample (about
+  0.5 ms). Only visible windows count, since hidden windows of background apps can sit
+  unpumped harmlessly. Windows hides a hung window behind a "ghost" (class `Ghost`,
+  owned by `dwm.exe`, which itself reports as hung); ghosts are excluded but matched by
+  title to the hidden original. The owning process is recorded with its command line
+  and ancestry like any offender. This only works in the user's session, which is why
+  the logon task runs interactively (below).
 
 ## Storage
 
@@ -153,9 +198,10 @@ functions. Process identity is `(pid, create_time_utc)`.
 | Table | Contents |
 |---|---|
 | `adapter` | LUID to adapter description, refreshed at startup |
-| `incident` | start/end, triggers fired (e.g. `cpu+core`), sample count, peak CPU/GPU/per-process core |
-| `sample` | one row per sample during an incident: totals, busiest process, triggers, seconds covered (`interval_s`, schema v2) |
+| `incident` | start/end, triggers fired (e.g. `cpu+stall`), sample count, peak CPU/GPU/per-process core, peak stall and DPC, most hung windows at once (v3) |
+| `sample` | one row per sample during an incident: totals, busiest process, triggers, seconds covered (`interval_s`, v2), stall, DPC/interrupt, CPU speed, temperature, memory, hung window count (v3) |
 | `sample_gpu_engine` | busy engines (>= 0.1%) per sample, per adapter |
+| `sample_hung_window` | windows not responding per sample: process, title, whether in the foreground (schema v3) |
 | `process` | one row per process instance: name, image path, command line, user, session, parent PID, link to parent row, `info_error`, first/last seen |
 | `process_sample` | each offender in each sample: CPU (% machine and % core), GPU %, engine, adapter, working set |
 
@@ -182,7 +228,8 @@ SELECT name FROM chain ORDER BY depth DESC LIMIT 1;
 
 ```
 cpumon monitor   [--interval 2s] [--cpu 80] [--gpu 80] [--proc-core 90]
-                 [--proc-cpu 10] [--proc-gpu 10] [--top 5] [--sustain 2] [--db PATH]
+                 [--proc-cpu 10] [--proc-gpu 10] [--top 5] [--stall 500ms] [--dpc 30]
+                 [--sustain 2] [--db PATH]
 cpumon report    [--since 7d] [--by name|root|cmdline] [--metric cpu|gpu] [--top 20]
 cpumon incidents [--since 24h]
 cpumon show <incident-id> [--samples]   # processes, command lines, trees; --samples adds the timeline
@@ -258,21 +305,24 @@ installing the logon task with `--elevated`, captures everything.
 `cpumon install` registers a Task Scheduler task named `cpumon` through the Task
 Scheduler COM API (no `schtasks.exe`):
 
-- Trigger: logon of the installing user. Action: the current `cpumon.exe` with
-  `--db <absolute path> monitor <the given monitor options>`.
-- Principal: that user with logon type S4U ("run whether the user is logged on or not",
-  no password stored). S4U tasks run without a desktop, so no console window appears.
-  Registering an S4U task needs administrator rights, so `install` and `uninstall`
-  must run elevated, e.g. with Windows' built-in `sudo` (verified). The task itself
-  still runs with the user's normal rights unless `--elevated` is given, which sets
-  run level `HighestAvailable`.
+- Trigger: logon of the installing user. Action: `cpumonw.exe` (next to `cpumon.exe`)
+  with `--db <absolute path> monitor <the given monitor options>`.
+- `cpumonw.exe` is the same program built for the Windows GUI subsystem, so it runs
+  without a console window; its output is discarded.
+- Principal: that user with the interactive logon type ("run only when the user is
+  logged on"), so it runs in the user's session and can see which windows stop
+  responding. An earlier version used S4U ("run whether logged on or not"), which
+  needed admin rights to register and ran in session 0, where the user's windows are
+  invisible. `--elevated` sets run level `HighestAvailable` and needs an elevated
+  terminal (e.g. Windows' built-in `sudo`); tasks registered that way, or by the S4U
+  version, also need one to remove.
 - Settings: no time limit, runs on battery, one instance, normal priority, restarted up
   to 3 times a minute apart if it fails. Started immediately unless `--no-start`.
 - Stopping the task ends the process without Ctrl+C; the incident left open is closed
   at its last sample on the next start.
 
 `cpumon uninstall` stops and deletes the task (the database is kept); `cpumon status`
-reports whether it is installed and running. Reinstall after moving `cpumon.exe`.
+reports whether it is installed and running. Reinstall after moving the executables.
 
 ## Roadmap
 
@@ -289,4 +339,7 @@ reports whether it is installed and running. Reinstall after moving `cpumon.exe`
 6. ~~`report`, `incidents`, `show`, `db` commands.~~ Done: grouping by name, command
    line or application root; `db prune` removes old incidents and orphaned processes.
 7. ~~`install` logon task.~~ Done: `install`, `uninstall`, `status`.
-8. Later: ETW option, GUI/dashboard.
+8. ~~Responsiveness signals.~~ Done: stall probe, DPC/interrupt time, CPU speed,
+   temperature, memory and hung windows; `stall`, `dpc` and `hung` triggers; the logon
+   task runs windowless in the user's session.
+9. Later: ETW option, GUI/dashboard.

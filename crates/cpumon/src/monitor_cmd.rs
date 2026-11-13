@@ -16,6 +16,7 @@ use cpumon_core::recorder::{NewProcess, Recorder};
 use cpumon_core::sampler::{Sample, Sampler};
 use cpumon_core::store::Store;
 use cpumon_core::time::{local_timestamp, now_filetime};
+use cpumon_core::totals::Health;
 
 use crate::gpu_cmd::adapter_name;
 use crate::output::truncate;
@@ -54,7 +55,18 @@ pub struct MonitorArgs {
     #[arg(long, default_value_t = 5)]
     pub top: usize,
 
-    /// Consecutive high samples to start an incident, and normal samples to end it
+    /// A thread kept waiting this long counts as a stall (the machine froze); starts an
+    /// incident at once
+    #[arg(long, default_value = "500ms", value_parser = parse_duration)]
+    pub stall: Duration,
+
+    /// One logical CPU spending at least this % in DPCs and interrupts counts as a
+    /// driver problem; starts an incident at once
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub dpc: u8,
+
+    /// Consecutive high samples to start an incident (for CPU, GPU and core), and
+    /// normal samples to end any incident
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
     pub sustain: u32,
 }
@@ -65,6 +77,8 @@ impl MonitorArgs {
             cpu: f64::from(self.cpu),
             gpu: f64::from(self.gpu),
             proc_core: f64::from(self.proc_core),
+            stall_ms: self.stall.as_secs_f64() * 1000.0,
+            dpc: f64::from(self.dpc),
             sustain: self.sustain,
         }
     }
@@ -72,13 +86,17 @@ impl MonitorArgs {
     /// The options as command-line arguments, for running the monitor elsewhere (the
     /// scheduled task).
     pub fn to_args(&self) -> Vec<String> {
-        let interval = if self.interval.subsec_millis() == 0 {
-            format!("{}s", self.interval.as_secs())
-        } else {
-            format!("{}ms", self.interval.as_millis())
+        let duration = |d: Duration| {
+            if d.subsec_millis() == 0 {
+                format!("{}s", d.as_secs())
+            } else {
+                format!("{}ms", d.as_millis())
+            }
         };
         [
-            ("--interval", interval),
+            ("--interval", duration(self.interval)),
+            ("--stall", duration(self.stall)),
+            ("--dpc", self.dpc.to_string()),
             ("--cpu", self.cpu.to_string()),
             ("--gpu", self.gpu.to_string()),
             ("--proc-core", self.proc_core.to_string()),
@@ -125,13 +143,16 @@ pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
 
     println!(
         "Sampling every {:?} on {} logical CPUs. An incident starts when CPU >= {}%, GPU >= {}% \
-         or one process >= {}% of a core for {} samples in a row.",
+         or one process >= {}% of a core for {} samples in a row, or at once when the system \
+         stalls for {:?}, a CPU spends {}% in DPCs/interrupts, or a window stops responding.",
         args.interval,
         sampler.logical_cpus(),
         args.cpu,
         args.gpu,
         args.proc_core,
         args.sustain,
+        args.stall,
+        args.dpc,
     );
     println!("Recording to {}. Ctrl+C to stop.", db.display());
     if closed > 0 {
@@ -164,6 +185,9 @@ pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
             cpu: sample.cpu_total,
             gpu: sample.gpu.max_engine(),
             max_proc_core: sample.cpu.first().map_or(0.0, |p| p.pct_core),
+            stall_ms: sample.stall.as_secs_f64() * 1000.0,
+            max_core_dpc: sample.health.max_core_dpc,
+            hung_windows: sample.hung.len(),
         };
         let (transition, triggers) = tracker.observe(&observation);
         let incident = match transition {
@@ -180,12 +204,28 @@ pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
             println!("{ts}  INCIDENT START ({triggers})");
         }
         println!(
-            "{ts}  CPU {:5.1}%  GPU {:5.1}% (sum {:.1}%)  busiest process {:.1}% of a core  [{triggers}]",
+            "{ts}  CPU {:5.1}%  GPU {:5.1}% (sum {:.1}%)  busiest process {:.1}% of a core  \
+             stall {:.0} ms  [{triggers}]",
             observation.cpu,
             observation.gpu,
             sample.gpu.sum(),
             observation.max_proc_core,
+            observation.stall_ms,
         );
+        println!("{:21}{}", "", health_line(&sample.health));
+        for window in sample.hung {
+            println!(
+                "    not responding: {} ({}) \"{}\"{}",
+                sample.snapshot.name_of(window.pid).unwrap_or("?"),
+                window.pid,
+                truncate(&window.title, 80),
+                if window.foreground {
+                    " [foreground]"
+                } else {
+                    ""
+                },
+            );
+        }
         let offenders = select_offenders(sample.cpu, &sample.gpu.processes, &limits, |pid| {
             sample.snapshot.find(pid).map(|e| e.key())
         });
@@ -216,6 +256,30 @@ pub fn run(args: &MonitorArgs, db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// DPC/interrupt time, CPU speed, temperature and memory on one line.
+fn health_line(h: &Health) -> String {
+    let mut parts = vec![format!(
+        "DPC {:.1}% + interrupts {:.1}% (worst CPU {:.1}%)",
+        h.dpc, h.interrupt, h.max_core_dpc
+    )];
+    if let Some(perf) = h.cpu_performance {
+        parts.push(format!("CPU speed {perf:.0}%"));
+    }
+    if let Some(t) = h.temperature_c {
+        parts.push(format!("{t:.0} C"));
+    }
+    if let Some(mb) = h.memory_available_mb {
+        parts.push(format!("{:.1} GB free", mb / 1024.0));
+    }
+    if let Some(c) = h.memory_committed {
+        parts.push(format!("commit {c:.0}%"));
+    }
+    if let Some(p) = h.pages_input_per_sec {
+        parts.push(format!("paging {p:.0} pages/s"));
+    }
+    parts.join("  ")
+}
+
 fn end_incident(recorder: &mut Recorder, incident: &Incident, duration: Duration) {
     let id = recorder.incident_id();
     if let Err(e) = recorder.end(incident, now_filetime()) {
@@ -225,7 +289,8 @@ fn end_incident(recorder: &mut Recorder, incident: &Incident, duration: Duration
         );
     }
     println!(
-        "{}  INCIDENT END{} after {}s ({} samples, {}): peak CPU {:.1}%, GPU {:.1}%, process {:.1}% of a core",
+        "{}  INCIDENT END{} after {}s ({} samples, {}): peak CPU {:.1}%, GPU {:.1}%, \
+         process {:.1}% of a core, stall {:.0} ms, worst CPU in DPCs {:.1}%, {} hung window(s)",
         local_timestamp(),
         id.map(|id| format!(" #{id}")).unwrap_or_default(),
         duration.as_secs(),
@@ -234,6 +299,9 @@ fn end_incident(recorder: &mut Recorder, incident: &Incident, duration: Duration
         incident.peak_cpu,
         incident.peak_gpu,
         incident.peak_proc_core,
+        incident.peak_stall_ms,
+        incident.peak_dpc,
+        incident.peak_hung_windows,
     );
     println!();
 }
